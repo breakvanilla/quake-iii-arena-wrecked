@@ -1,0 +1,139 @@
+diff --git a/code/game/g_local.h b/code/game/g_local.h
+index 10ec8dbf44a5770f79ccdabcc175b7beeab4e3d0..5effecb93378b28b34c94282ee0a523553c3c262 100644
+--- a/code/game/g_local.h
++++ b/code/game/g_local.h
+@@ -736,6 +736,20 @@ extern	vmCvar_t	g_obeliskRespawnDelay;
+ extern	vmCvar_t	g_cubeTimeout;
+ extern	vmCvar_t	g_redteam;
+ extern	vmCvar_t	g_blueteam;
++extern	vmCvar_t	g_destruction;
++
++// what a shot carves into the world, see holeKind_t in the engine
++#define	HOLE_KIND_BLAST		0	// rockets
++#define	HOLE_KIND_CHIP		1	// bullets
++#define	HOLE_KIND_MELT		2	// plasma
++#define	HOLE_KIND_DRILL		3	// railgun
++
++#define	HOLE_RADIUS_BULLET	5
++#define	HOLE_RADIUS_PELLET	9
++#define	HOLE_RADIUS_PLASMA	16
++#define	HOLE_RADIUS_RAIL	6
++
++void G_WorldHole( const trace_t *trace, float radius, int kind );
+ extern	vmCvar_t	g_smoothClients;
+ extern	vmCvar_t	pmove_fixed;
+ extern	vmCvar_t	pmove_msec;
+diff --git a/code/game/g_main.c b/code/game/g_main.c
+index ed5d4ead802c373b57a090aa3d468ec4d13f8a33..7c8c8eddf2179a5b354ca8f86c84e7e20d5991a3 100644
+--- a/code/game/g_main.c
++++ b/code/game/g_main.c
+@@ -76,6 +76,7 @@ vmCvar_t	g_teamAutoJoin;
+ vmCvar_t	g_teamForceBalance;
+ vmCvar_t	g_banIPs;
+ vmCvar_t	g_filterBan;
++vmCvar_t	g_destruction;
+ vmCvar_t	g_smoothClients;
+ vmCvar_t	pmove_fixed;
+ vmCvar_t	pmove_msec;
+@@ -173,6 +174,7 @@ static cvarTable_t		gameCvarTable[] = {
+ 	{ &g_enableBreath, "g_enableBreath", "0", CVAR_SERVERINFO, 0, qtrue, qfalse },
+ 	{ &g_proxMineTimeout, "g_proxMineTimeout", "20000", 0, 0, qfalse },
+ #endif
++	{ &g_destruction, "g_destruction", "40", CVAR_ARCHIVE, 0, qfalse },
+ 	{ &g_smoothClients, "g_smoothClients", "1", 0, 0, qfalse},
+ 	{ &pmove_fixed, "pmove_fixed", "0", CVAR_SYSTEMINFO, 0, qfalse},
+ 	{ &pmove_msec, "pmove_msec", "8", CVAR_SYSTEMINFO, 0, qfalse},
+@@ -420,6 +422,9 @@ void G_InitGame( int levelTime, int randomSeed, int restart ) {
+ 
+ 	G_InitMemory();
+ 
++	// holes blasted into the previous level or before a restart are gone
++	trap_SendConsoleCommand( EXEC_NOW, "clearholes\n" );
++
+ 	// set some level globals
+ 	memset( &level, 0, sizeof( level ) );
+ 	level.time = levelTime;
+diff --git a/code/game/g_missile.c b/code/game/g_missile.c
+index 3a138b959aa6f8e9c1bc62176d9290ee2eb44af5..3c2d7528a2adba45933a664ec30b38f4c5744fc1 100644
+--- a/code/game/g_missile.c
++++ b/code/game/g_missile.c
+@@ -437,6 +437,13 @@ void G_MissileImpact( gentity_t *ent, trace_t *trace ) {
+ 		}
+ 	}
+ 
++	// rockets blast craters into walls, plasma melts pits
++	if ( ent->s.weapon == WP_ROCKET_LAUNCHER ) {
++		G_WorldHole( trace, g_destruction.value, HOLE_KIND_BLAST );
++	} else if ( ent->s.weapon == WP_PLASMAGUN ) {
++		G_WorldHole( trace, HOLE_RADIUS_PLASMA, HOLE_KIND_MELT );
++	}
++
+ 	trap_LinkEntity( ent );
+ }
+ 
+diff --git a/code/game/g_weapon.c b/code/game/g_weapon.c
+index d78afb0f7a362243660f5c61103944c11173c641..4abe49406a17c8e1df34bed762812eebb2f261a4 100644
+--- a/code/game/g_weapon.c
++++ b/code/game/g_weapon.c
+@@ -161,6 +161,37 @@ void SnapVectorTowards( vec3_t v, vec3_t to ) {
+ #define	MACHINEGUN_DAMAGE	7
+ #define	MACHINEGUN_TEAM_DAMAGE	5		// wimpier MG in teamplay
+ 
++/*
++================
++G_WorldHole
++
++Has the engine carve the world where a shot hit it; it decides what gives way
++================
++*/
++void G_WorldHole( const trace_t *trace, float radius, int kind ) {
++	float	args[7];
++	char	cmd[256];
++	int		i, n;
++
++	if ( g_destruction.value <= 0 || trace->entityNum != ENTITYNUM_WORLD || ( trace->surfaceFlags & SURF_NOIMPACT ) ) {
++		return;
++	}
++
++	// in hundredths: the QVM's %f sometimes mangles fractions and cuts the command short
++	for ( i = 0 ; i < 3 ; i++ ) {
++		args[i] = trace->endpos[i];
++		args[3 + i] = trace->plane.normal[i];
++	}
++	args[6] = radius;
++	Q_strncpyz( cmd, "addhole", sizeof( cmd ) );
++	for ( i = 0 ; i < 7 ; i++ ) {
++		n = (int)( fabs( args[i] ) * 100 + 0.5f );
++		Q_strcat( cmd, sizeof( cmd ), va( " %s%i.%02i", args[i] < 0 ? "-" : "", n / 100, n % 100 ) );
++	}
++	Q_strcat( cmd, sizeof( cmd ), va( " %i\n", kind ) );
++	trap_SendConsoleCommand( EXEC_NOW, cmd );
++}
++
+ void Bullet_Fire (gentity_t *ent, float spread, int damage, int mod ) {
+ 	trace_t		tr;
+ 	vec3_t		end;
+@@ -191,6 +222,7 @@ void Bullet_Fire (gentity_t *ent, float spread, int damage, int mod ) {
+ 		}
+ 
+ 		traceEnt = &g_entities[ tr.entityNum ];
++		G_WorldHole( &tr, HOLE_RADIUS_BULLET, HOLE_KIND_CHIP );
+ 
+ 		// snap the endpos to integers, but nudged towards the line
+ 		SnapVectorTowards( tr.endpos, muzzle );
+@@ -312,6 +344,7 @@ qboolean ShotgunPellet( vec3_t start, vec3_t end, gentity_t *ent ) {
+ 			G_Damage( traceEnt, ent, ent, forward, tr.endpos, damage, 0, MOD_SHOTGUN);
+ 			return hitClient;
+ 		}
++		G_WorldHole( &tr, HOLE_RADIUS_PELLET, HOLE_KIND_CHIP );
+ 		return qfalse;
+ 	}
+ 	return qfalse;
+@@ -513,6 +546,7 @@ void weapon_railgun_fire (gentity_t *ent) {
+ 	}
+ 
+ 	// the final trace endpos will be the terminal point of the rail trail
++	G_WorldHole( &trace, HOLE_RADIUS_RAIL, HOLE_KIND_DRILL );
+ 
+ 	// snap the endpos to integers to save net bandwidth, but nudged towards the line
+ 	SnapVectorTowards( trace.endpos, muzzle );

@@ -1,0 +1,6 @@
+# upstream ioquake3 with patches/ applied (engine/), release zips (dist/), test scripts and other local data
+/local/
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,159 @@
+diff --git a/code/server/sv_ccmds.c b/code/server/sv_ccmds.c
+index 6ae530cde8d09ab0fc78fad841609863f0ceb3e4..4289a3633b8a28f7b37c15b7c57e8a1d640b710b 100644
+--- a/code/server/sv_ccmds.c
++++ b/code/server/sv_ccmds.c
+@@ -1457,6 +1457,85 @@ static void SV_KillServer_f( void ) {
+ 	SV_Shutdown( "killserver" );
+ }
+ 
++/*
++=================
++SV_AddHole_f
++
++addhole <x> <y> <z> <nx> <ny> <nz> <radius> [kind]
++
++kind is a holeKind_t, a blast if left out
++=================
++*/
++static void SV_AddHole_f( void ) {
++	const worldHole_t	*hole;
++	vec3_t		origin, normal;
++	int			i, num, cell, carved;
++
++	if ( !com_sv_running->integer ) {
++		return;
++	}
++	if ( Cmd_Argc() != 8 && Cmd_Argc() != 9 ) {
++		Com_Printf( "usage: addhole <x> <y> <z> <nx> <ny> <nz> <radius> [kind], not: %s\n", Cmd_Args() );
++		return;
++	}
++
++	for ( i = 0 ; i < 3 ; i++ ) {
++		origin[i] = atof( Cmd_Argv( 1 + i ) );
++		normal[i] = atof( Cmd_Argv( 4 + i ) );
++	}
++
++	num = CM_AddWorldHole( origin, normal, atof( Cmd_Argv( 7 ) ), Com_Clamp( HOLE_BLAST, HOLE_DRILL, atoi( Cmd_Argv( 8 ) ) ) );
++	if ( num >= 0 && com_developer->integer ) {
++		hole = CM_GetWorldHole( num );
++		carved = 0;
++		for ( cell = 0 ; cell < WORLD_HOLE_GRID * WORLD_HOLE_GRID ; cell++ ) {
++			if ( hole->depth[cell] >= WORLD_HOLE_BIAS + WORLD_HOLE_RIM ) {
++				carved++;
++			}
++		}
++		Com_Printf( "hole %i at (%.1f %.1f %.1f) normal (%.2f %.2f) %i points carved, max depth %.0f\n",
++			num, hole->origin[0], hole->origin[1], hole->origin[2], hole->normal[0], hole->normal[1],
++			carved, hole->maxDepth );
++	}
++}
++
++static void SV_ClearHoles_f( void ) {
++	CM_ClearWorldHoles();
++}
++
++/*
++=================
++SV_HoleTrace_f
++
++holetrace <x1> <y1> <z1> <x2> <y2> <z2> [player]
++=================
++*/
++static void SV_HoleTrace_f( void ) {
++	vec3_t		start, end;
++	vec3_t		mins = { 0, 0, 0 }, maxs = { 0, 0, 0 };
++	trace_t		trace;
++	int			i;
++
++	if ( !com_sv_running->integer || Cmd_Argc() < 7 ) {
++		Com_Printf( "usage: holetrace <x1> <y1> <z1> <x2> <y2> <z2> [player]\n" );
++		return;
++	}
++
++	for ( i = 0 ; i < 3 ; i++ ) {
++		start[i] = atof( Cmd_Argv( 1 + i ) );
++		end[i] = atof( Cmd_Argv( 4 + i ) );
++	}
++	if ( Cmd_Argc() > 7 ) {
++		VectorSet( mins, -15, -15, -24 );
++		VectorSet( maxs, 15, 15, 32 );
++	}
++
++	CM_BoxTrace( &trace, start, end, mins, maxs, 0, MASK_PLAYERSOLID, qfalse );
++	Com_Printf( "fraction %.3f endpos (%.1f %.1f %.1f) normal (%.2f %.2f %.2f) startsolid %i allsolid %i\n",
++		trace.fraction, trace.endpos[0], trace.endpos[1], trace.endpos[2],
++		trace.plane.normal[0], trace.plane.normal[1], trace.plane.normal[2], trace.startsolid, trace.allsolid );
++}
++
+ //===========================================================
+ 
+ /*
+@@ -1550,6 +1629,9 @@ void SV_AddOperatorCommands( void ) {
+ 	Cmd_SetCommandCompletionFunc( "spdevmap", SV_CompleteMapName );
+ #endif
+ 	Cmd_AddCommand ("killserver", SV_KillServer_f);
++	Cmd_AddCommand ("addhole", SV_AddHole_f);
++	Cmd_AddCommand ("clearholes", SV_ClearHoles_f);
++	Cmd_AddCommand ("holetrace", SV_HoleTrace_f);
+ 	if( com_dedicated->integer ) {
+ 		Cmd_AddCommand ("say", SV_ConSay_f);
+ 		Cmd_AddCommand ("tell", SV_ConTell_f);
+diff --git a/code/server/sv_snapshot.c b/code/server/sv_snapshot.c
+index ec76071318467d01a3eba7618467ca61026adcc6..b1603f0470b4d29d485cdab5ddbd1927dbd2d15c 100644
+--- a/code/server/sv_snapshot.c
++++ b/code/server/sv_snapshot.c
+@@ -381,30 +381,34 @@ static void SV_AddEntitiesVisibleFromPoint( vec3_t origin, clientSnapshot_t *fra
+ 
+ 		// check individual leafs
+ 		if ( !svEnt->numClusters ) {
+-			continue;
+-		}
+-		l = 0;
+-		for ( i=0 ; i < svEnt->numClusters ; i++ ) {
+-			l = svEnt->clusternums[i];
+-			if ( bitvector[l >> 3] & (1 << (l&7) ) ) {
+-				break;
++			// something inside a wall, like a rocket going off at the bottom of a crater, has no cluster; once there are holes everything is visible anyway (see CM_ClusterPVS)
++			if ( !CM_NumWorldHoles() ) {
++				continue;
++			}
++		} else {
++			l = 0;
++			for ( i=0 ; i < svEnt->numClusters ; i++ ) {
++				l = svEnt->clusternums[i];
++				if ( bitvector[l >> 3] & (1 << (l&7) ) ) {
++					break;
++				}
+ 			}
+-		}
+ 
+-		// if we haven't found it to be visible,
+-		// check overflow clusters that coudln't be stored
+-		if ( i == svEnt->numClusters ) {
+-			if ( svEnt->lastCluster ) {
+-				for ( ; l <= svEnt->lastCluster ; l++ ) {
+-					if ( bitvector[l >> 3] & (1 << (l&7) ) ) {
+-						break;
++			// if we haven't found it to be visible,
++			// check overflow clusters that coudln't be stored
++			if ( i == svEnt->numClusters ) {
++				if ( svEnt->lastCluster ) {
++					for ( ; l <= svEnt->lastCluster ; l++ ) {
++						if ( bitvector[l >> 3] & (1 << (l&7) ) ) {
++							break;
++						}
+ 					}
++					if ( l == svEnt->lastCluster ) {
++						continue;	// not visible
++					}
++				} else {
++					continue;
+ 				}
+-				if ( l == svEnt->lastCluster ) {
+-					continue;	// not visible
+-				}
+-			} else {
+-				continue;
+ 			}
+ 		}
+ 

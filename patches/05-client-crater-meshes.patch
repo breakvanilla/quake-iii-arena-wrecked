@@ -1,0 +1,395 @@
+diff --git a/code/client/cl_cgame.c b/code/client/cl_cgame.c
+index bfa0bea24475c9815cb1f00bcccb0616c6a4fc4e..6b542fd0daa92ec906250f556a7c0d1ec6d0999a 100644
+--- a/code/client/cl_cgame.c
++++ b/code/client/cl_cgame.c
+@@ -400,6 +400,354 @@ static int	FloatAsInt( float f ) {
+ 	return fi.i;
+ }
+ 
++#define	MAX_RENDER_WORLD_HOLES	128
++#define	HOLE_SURFACE_INSET	0.5f	// the crater surface sits this far into the rock, clear of the cut
++#define	HOLE_ROCK_TEXTURE	128.0f	// units per repeat of crater textures, before the material's own scale
++#define	HOLE_GLOW_TIME		3000	// msec freshly blasted rock takes to cool down
++
++typedef struct {
++	int			serial;
++	int			numPolys;
++	polyVert_t	*verts;		// four per poly
++	float		*vertTimes;	// when the rock at each vert was blasted
++	float		*vertGlows;	// and how brightly it glows while hot, blue-white if negative
++	polyVert_t	*glowVerts;
++	int			hotUntil;
++	vec3_t		origin;		// to tell when the slot gets another hole
++	char		material[MAX_QPATH];
++	qhandle_t	shader;		// the blasted wall's own texture, or plain rock
++	byte		lastDepth[WORLD_HOLE_GRID * WORLD_HOLE_GRID];
++	int			carveTimes[WORLD_HOLE_GRID * WORLD_HOLE_GRID];
++} clHoleMesh_t;
++
++typedef struct {
++	qboolean	done;
++	vec3_t		xyz;
++	byte		color[4];
++	float		time;
++	float		glow;
++} clHoleNode_t;
++
++static clHoleMesh_t	cl_holeMeshes[MAX_RENDER_WORLD_HOLES];
++static clHoleNode_t	cl_holeNodes[WORLD_HOLE_GRID * WORLD_HOLE_GRID];
++static const int	*cl_holeCarveTimes;
++static qhandle_t	cl_holeRockShader;
++static qhandle_t	cl_holeGlowShader;
++static qboolean		cl_holesCold;	// the meshes were rebuilt for holes blasted long ago
++
++static void CL_FreeHoleMesh( clHoleMesh_t *mesh ) {
++	if ( mesh->verts ) {
++		Z_Free( mesh->verts );
++		Z_Free( mesh->vertTimes );
++		Z_Free( mesh->vertGlows );
++		Z_Free( mesh->glowVerts );
++	}
++	mesh->verts = NULL;
++	mesh->vertTimes = NULL;
++	mesh->vertGlows = NULL;
++	mesh->glowVerts = NULL;
++}
++
++static void CL_ClearHoleMeshes( void ) {
++	int		i;
++
++	for ( i = 0 ; i < MAX_RENDER_WORLD_HOLES ; i++ ) {
++		CL_FreeHoleMesh( &cl_holeMeshes[i] );
++	}
++	Com_Memset( cl_holeMeshes, 0, sizeof( cl_holeMeshes ) );
++}
++
++static void CL_HolePoint( const worldHole_t *hole, float a, float b, float h, vec3_t p ) {
++	VectorMA( hole->origin, a, hole->axis, p );
++	VectorMA( p, b, hole->up, p );
++	VectorMA( p, h, hole->normal, p );
++}
++
++static int CL_HoleDepth( const worldHole_t *hole, int i, int j ) {
++	i = Com_Clamp( 0, WORLD_HOLE_GRID - 1, i );
++	j = Com_Clamp( 0, WORLD_HOLE_GRID - 1, j );
++	return MAX( hole->depth[j * WORLD_HOLE_GRID + i] - WORLD_HOLE_BIAS, 0 );
++}
++
++/*
++====================
++CL_HoleNode
++
++Position and lit rock colour of the crater surface at a grid point.
++====================
++*/
++static const clHoleNode_t *CL_HoleNode( const worldHole_t *hole, int cell ) {
++	clHoleNode_t	*node;
++	vec3_t			probe, ambient, directed, lightDir, normal;
++	float			a, b, d, lit, shade;
++	unsigned		noise;
++	int				i, j;
++
++	node = &cl_holeNodes[cell];
++	if ( node->done ) {
++		return node;
++	}
++	node->done = qtrue;
++
++	i = cell % WORLD_HOLE_GRID;
++	j = cell / WORLD_HOLE_GRID;
++	a = ( i - WORLD_HOLE_GRID / 2 ) * WORLD_HOLE_CELL;
++	b = ( j - WORLD_HOLE_GRID / 2 ) * WORLD_HOLE_CELL;
++	d = MAX( hole->depth[cell] - WORLD_HOLE_BIAS, 0 );
++	CL_HolePoint( hole, a, b, -d - HOLE_SURFACE_INSET, node->xyz );
++
++	// the surface faces out of the crater, tilted by how fast it gets deeper
++	VectorCopy( hole->normal, normal );
++	VectorMA( normal, ( CL_HoleDepth( hole, i + 1, j ) - CL_HoleDepth( hole, i - 1, j ) ) / ( 2.0f * WORLD_HOLE_CELL ),
++		hole->axis, normal );
++	VectorMA( normal, ( CL_HoleDepth( hole, i, j + 1 ) - CL_HoleDepth( hole, i, j - 1 ) ) / ( 2.0f * WORLD_HOLE_CELL ),
++		hole->up, normal );
++	VectorNormalize( normal );
++
++	CL_HolePoint( hole, a, b, 8, probe );
++	if ( !re.LightForPoint( probe, ambient, directed, lightDir ) ) {
++		VectorSet( ambient, 96, 96, 96 );
++		VectorClear( directed );
++		VectorCopy( hole->normal, lightDir );
++	}
++	lit = DotProduct( normal, lightDir );
++	if ( lit < 0 ) {
++		lit = 0;
++	}
++
++	// broken material, a little uneven, that gets darker further in
++	noise = (unsigned)cell * 1103515245u + 12345u;
++	shade = ( 0.94f + 0.08f * ( ( noise >> 16 ) & 255 ) / 255.0f ) * ( 1.0f - 0.3f * MIN( d / 40.0f, 1.0f ) );
++	node->color[0] = Com_Clamp( 0, 255, ( 32 + ambient[0] * 1.5f + directed[0] * lit * 1.2f ) * shade );
++	node->color[1] = Com_Clamp( 0, 255, ( 32 + ambient[1] * 1.5f + directed[1] * lit * 1.2f ) * shade );
++	node->color[2] = Com_Clamp( 0, 255, ( 32 + ambient[2] * 1.5f + directed[2] * lit * 1.2f ) * shade );
++	node->color[3] = 255;
++
++	// hot rock glows unevenly, unless bullets chipped it; plasma and rails leave it blue-white
++	node->time = cl_holeCarveTimes[cell];
++	node->glow = 0.5f + 0.5f * ( ( noise >> 8 ) & 255 ) / 255.0f;
++	if ( hole->flags[cell] & HOLECELL_COLD ) {
++		node->glow = 0;
++	} else if ( hole->flags[cell] & HOLECELL_PLASMA ) {
++		node->glow = -node->glow;
++	}
++	return node;
++}
++
++/*
++====================
++CL_HoleTriangle
++
++One triangle of a crater's surface, as a four corner poly.
++====================
++*/
++static void CL_HoleTriangle( polyVert_t *out, float *times, float *glows, const worldHole_t *hole, const int cells[3] ) {
++	const clHoleNode_t	*nodes[3];
++	vec3_t				edge1, edge2, cross, local;
++	int					k, s0, s1;
++
++	for ( k = 0 ; k < 3 ; k++ ) {
++		nodes[k] = CL_HoleNode( hole, cells[k] );
++		VectorCopy( nodes[k]->xyz, out[k].xyz );
++		Byte4Copy( nodes[k]->color, out[k].modulate );
++		times[k] = nodes[k]->time;
++		glows[k] = nodes[k]->glow;
++	}
++	out[3] = out[2];
++	times[3] = times[2];
++	glows[3] = glows[2];
++
++	// wrap the texture around from whichever side faces the triangle most
++	VectorSubtract( nodes[1]->xyz, nodes[0]->xyz, edge1 );
++	VectorSubtract( nodes[2]->xyz, nodes[0]->xyz, edge2 );
++	CrossProduct( edge1, edge2, cross );
++	local[0] = fabs( DotProduct( cross, hole->axis ) );
++	local[1] = fabs( DotProduct( cross, hole->up ) );
++	local[2] = fabs( DotProduct( cross, hole->normal ) );
++	if ( local[2] >= local[0] && local[2] >= local[1] ) {
++		s0 = 0;
++		s1 = 1;
++	} else if ( local[0] >= local[1] ) {
++		s0 = 1;
++		s1 = 2;
++	} else {
++		s0 = 0;
++		s1 = 2;
++	}
++	for ( k = 0 ; k < 4 ; k++ ) {
++		VectorSubtract( out[k].xyz, hole->origin, edge1 );
++		local[0] = DotProduct( edge1, hole->axis );
++		local[1] = DotProduct( edge1, hole->up );
++		local[2] = DotProduct( edge1, hole->normal );
++		out[k].st[0] = local[s0] / HOLE_ROCK_TEXTURE;
++		out[k].st[1] = local[s1] / HOLE_ROCK_TEXTURE;
++	}
++}
++
++/*
++====================
++CL_BuildHoleMesh
++
++The rock surface of a crater, a poly per half cell the crater reaches into. Only counts the polys when build is qfalse.
++====================
++*/
++static int CL_BuildHoleMesh( clHoleMesh_t *mesh, const worldHole_t *hole, qboolean build ) {
++	int		tris[2][3];
++	int		i, j, k, t, c, n, maxDepth;
++
++	if ( build ) {
++		Com_Memset( cl_holeNodes, 0, sizeof( cl_holeNodes ) );
++		cl_holeCarveTimes = mesh->carveTimes;
++	}
++
++	n = 0;
++	for ( j = 0 ; j < WORLD_HOLE_GRID - 1 ; j++ ) {
++		for ( i = 0 ; i < WORLD_HOLE_GRID - 1 ; i++ ) {
++			c = j * WORLD_HOLE_GRID + i;
++
++			// the same split along (i,j)-(i+1,j+1) as the cut and the collision
++			tris[0][0] = c;
++			tris[0][1] = c + 1;
++			tris[0][2] = c + WORLD_HOLE_GRID + 1;
++			tris[1][0] = c;
++			tris[1][1] = c + WORLD_HOLE_GRID + 1;
++			tris[1][2] = c + WORLD_HOLE_GRID;
++
++			for ( t = 0 ; t < 2 ; t++ ) {
++				maxDepth = 0;
++				for ( k = 0 ; k < 3 ; k++ ) {
++					maxDepth = MAX( maxDepth, hole->depth[tris[t][k]] );
++				}
++				if ( maxDepth <= WORLD_HOLE_BIAS + WORLD_HOLE_RIM ) {
++					continue;
++				}
++
++				if ( build ) {
++					CL_HoleTriangle( &mesh->verts[n * 4], &mesh->vertTimes[n * 4], &mesh->vertGlows[n * 4], hole, tris[t] );
++				}
++				n++;
++			}
++		}
++	}
++	return n;
++}
++
++/*
++====================
++CL_AddHoleGlow
++
++Freshly blasted rock glowing white hot, cooling through orange to dull red, or for plasma and rails from white through pale to deep blue
++====================
++*/
++static void CL_AddHoleGlow( clHoleMesh_t *mesh ) {
++	polyVert_t	*v;
++	float		heat, glow;
++	int			i;
++
++	for ( i = 0 ; i < mesh->numPolys * 4 ; i++ ) {
++		v = &mesh->glowVerts[i];
++		VectorCopy( mesh->verts[i].xyz, v->xyz );
++		v->st[0] = mesh->verts[i].st[0];
++		v->st[1] = mesh->verts[i].st[1];
++
++		glow = mesh->vertGlows[i];
++		heat = 1.0f - ( cls.realtime - mesh->vertTimes[i] ) / HOLE_GLOW_TIME;
++		heat = heat > 0 ? heat * heat * fabs( glow ) : 0;
++		if ( glow < 0 ) {
++			v->modulate[0] = Com_Clamp( 0, 255, 255 * 0.35f * heat * heat * heat );
++			v->modulate[1] = Com_Clamp( 0, 255, 255 * 0.6f * heat * heat );
++			v->modulate[2] = Com_Clamp( 0, 255, 255 * 1.1f * heat );
++		} else {
++			v->modulate[0] = Com_Clamp( 0, 255, 255 * 1.6f * heat );
++			v->modulate[1] = Com_Clamp( 0, 255, 255 * 0.8f * heat * heat );
++			v->modulate[2] = Com_Clamp( 0, 255, 255 * 0.4f * heat * heat * heat * heat );
++		}
++		v->modulate[3] = 255;
++	}
++	re.AddPolyToScene( cl_holeGlowShader, 4, mesh->glowVerts, mesh->numPolys );
++}
++
++/*
++====================
++CL_AddWorldHoles
++
++Hands the collision model's holes to the renderer before a world scene is drawn, and lines their craters with rock.
++====================
++*/
++static void CL_AddWorldHoles( const refdef_t *fd ) {
++	float				holes[MAX_RENDER_WORLD_HOLES * 8];
++	const worldHole_t	*hole;
++	clHoleMesh_t		*mesh;
++	int					i, k, numHoles;
++
++	// the renderer only applies holes to world scenes, and the backend runs after every scene of the frame is queued, so model-only scenes must not reset them
++	if ( fd->rdflags & RDF_NOWORLDMODEL ) {
++		return;
++	}
++
++	numHoles = CM_NumWorldHoles();
++	if ( numHoles > MAX_RENDER_WORLD_HOLES ) {
++		numHoles = MAX_RENDER_WORLD_HOLES;
++	}
++
++	for ( i = 0 ; i < numHoles ; i++ ) {
++		hole = CM_GetWorldHole( i );
++		mesh = &cl_holeMeshes[i];
++
++		if ( mesh->serial != hole->serial ) {
++			mesh->serial = hole->serial;
++			CL_FreeHoleMesh( mesh );
++
++			if ( !VectorCompare( mesh->origin, hole->origin ) ) {
++				VectorCopy( hole->origin, mesh->origin );
++				Com_Memset( mesh->lastDepth, 0, sizeof( mesh->lastDepth ) );
++			}
++			if ( !mesh->shader || Q_stricmp( mesh->material, hole->material ) ) {
++				Q_strncpyz( mesh->material, hole->material, sizeof( mesh->material ) );
++				mesh->shader = hole->material[0] ? re.RegisterMaterialShader( hole->material, qfalse ) : 0;
++				if ( !mesh->shader ) {
++					mesh->shader = cl_holeRockShader;
++				}
++			}
++			// whatever got blasted deeper is hot
++			for ( k = 0 ; k < WORLD_HOLE_GRID * WORLD_HOLE_GRID ; k++ ) {
++				if ( hole->depth[k] > mesh->lastDepth[k] ) {
++					mesh->carveTimes[k] = cl_holesCold ? cls.realtime - HOLE_GLOW_TIME : cls.realtime;
++				}
++			}
++			Com_Memcpy( mesh->lastDepth, hole->depth, sizeof( mesh->lastDepth ) );
++			if ( !cl_holesCold ) {
++				mesh->hotUntil = cls.realtime + HOLE_GLOW_TIME;
++			}
++
++			mesh->numPolys = CL_BuildHoleMesh( mesh, hole, qfalse );
++			if ( mesh->numPolys ) {
++				mesh->verts = Z_Malloc( mesh->numPolys * 4 * sizeof( polyVert_t ) );
++				mesh->glowVerts = Z_Malloc( mesh->numPolys * 4 * sizeof( polyVert_t ) );
++				mesh->vertTimes = Z_Malloc( mesh->numPolys * 4 * sizeof( float ) );
++				mesh->vertGlows = Z_Malloc( mesh->numPolys * 4 * sizeof( float ) );
++				mesh->numPolys = CL_BuildHoleMesh( mesh, hole, qtrue );
++			}
++			re.SetWorldHoleMask( i, hole->depth );
++		}
++
++		VectorCopy( hole->origin, &holes[i * 8] );
++		holes[i * 8 + 3] = hole->maxDepth + 1;
++		VectorCopy( hole->normal, &holes[i * 8 + 4] );
++		holes[i * 8 + 7] = i;
++
++		if ( mesh->numPolys ) {
++			re.AddPolyToScene( mesh->shader, 4, mesh->verts, mesh->numPolys );
++			if ( cls.realtime < mesh->hotUntil ) {
++				CL_AddHoleGlow( mesh );
++			}
++		}
++	}
++
++	re.SetWorldHoles( numHoles, holes );
++	cl_holesCold = qfalse;
++}
++
+ /*
+ ====================
+ CL_CgameSystemCalls
+@@ -450,6 +798,14 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
+ 		return 0;
+ 	case CG_FS_SEEK:
+ 		return FS_Seek( args[1], args[2], args[3] );
++	case CG_R_WALLMATERIAL: {
++		char	material[MAX_QPATH];
++
++		if ( !CM_SurfaceMaterial( VMA(1), VMA(2), material, sizeof( material ) ) ) {
++			return 0;
++		}
++		return re.RegisterMaterialShader( material, qtrue );
++	}
+ 	case CG_SENDCONSOLECOMMAND:
+ 		Cbuf_AddText( VMA(1) );
+ 		return 0;
+@@ -563,6 +919,7 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
+ 		re.AddAdditiveLightToScene( VMA(1), VMF(2), VMF(3), VMF(4), VMF(5) );
+ 		return 0;
+ 	case CG_R_RENDERSCENE:
++		CL_AddWorldHoles( VMA(1) );
+ 		re.RenderScene( VMA(1) );
+ 		return 0;
+ 	case CG_R_SETCOLOR:
+@@ -744,6 +1101,12 @@ void CL_InitCGame( void ) {
+ 	// otherwise server commands sent just before a gamestate are dropped
+ 	VM_Call( cgvm, CG_INIT, clc.serverMessageSequence, clc.lastExecutedServerCommand, clc.clientNum );
+ 
++	cl_holeRockShader = re.RegisterShader( "gfx/wrecked-quake-iii-arena/rock" );
++	cl_holeGlowShader = re.RegisterShader( "gfx/wrecked-quake-iii-arena/rockglow" );
++	CL_ClearHoleMeshes();
++	// after a vid_restart the holes are still there, but no longer fresh
++	cl_holesCold = qtrue;
++
+ 	// reset any CVAR_CHEAT cvars registered by cgame
+ 	if ( !clc.demoplaying && !cl_connectedToCheatServer )
+ 		Cvar_SetCheatState();

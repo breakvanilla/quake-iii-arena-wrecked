@@ -1,0 +1,1444 @@
+diff --git a/code/cgame/cg_effects.c b/code/cgame/cg_effects.c
+index 9b2d0f7a9853525fb04086bda9b2690e0657170a..29e95fb9e34deaa7a7ebe306f08c569c0099d5f3 100644
+--- a/code/cgame/cg_effects.c
++++ b/code/cgame/cg_effects.c
+@@ -162,6 +162,759 @@ localEntity_t *CG_SmokePuff( const vec3_t p, const vec3_t vel,
+ 	return le;
+ }
+ 
++/*
++==================
++CG_LaunchDebris
++==================
++*/
++static void CG_LaunchDebris( const vec3_t origin, const vec3_t velocity, qhandle_t hShader,
++							float radius, const byte *color, int duration, float bounceFactor ) {
++	localEntity_t	*le;
++	refEntity_t		*re;
++
++	le = CG_AllocLocalEntity();
++	re = &le->refEntity;
++
++	le->leType = LE_FRAGMENT;
++	le->startTime = cg.time;
++	le->endTime = cg.time + duration;
++
++	re->reType = RT_SPRITE;
++	re->customShader = hShader;
++	re->radius = radius;
++	re->rotation = random() * 360;
++	re->shaderRGBA[0] = color[0];
++	re->shaderRGBA[1] = color[1];
++	re->shaderRGBA[2] = color[2];
++	re->shaderRGBA[3] = color[3];
++	VectorCopy( origin, re->origin );
++	AxisCopy( axisDefault, re->axis );
++
++	le->pos.trType = TR_GRAVITY;
++	VectorCopy( origin, le->pos.trBase );
++	VectorCopy( velocity, le->pos.trDelta );
++	le->pos.trTime = cg.time;
++
++	le->bounceFactor = bounceFactor;
++	le->leBounceSoundType = LEBS_NONE;
++	le->leMarkType = LEMT_NONE;
++}
++
++/*
++==================
++CG_RockSound
++
++A stone knocking on stone. A blast throws out dozens of them at once, so no more than a few play close together, and never the same one twice in a row.
++==================
++*/
++void CG_RockSound( vec3_t origin ) {
++	static int	recent[3];
++	static int	last;
++	int			i, oldest, pick;
++
++	oldest = 0;
++	for ( i = 1 ; i < 3 ; i++ ) {
++		if ( recent[i] < recent[oldest] ) {
++			oldest = i;
++		}
++	}
++	if ( recent[oldest] > cg.time - 150 && recent[oldest] <= cg.time ) {
++		return;
++	}
++	recent[oldest] = cg.time;
++
++	pick = rand() % ( NUM_ROCK_SOUNDS - 1 );
++	if ( pick >= last ) {
++		pick++;
++	}
++	last = pick;
++	trap_S_StartSound( origin, ENTITYNUM_WORLD, CHAN_AUTO, cgs.media.rockSounds[pick] );
++}
++
++/*
++==================
++CG_LaunchRock
++
++A tumbling lump of rock that bounces around and settles on the floor. size is the chunk model index, or -1 for gravel. material is the wall it came out of, see trap_R_WallMaterial, or 0 for plain rock.
++==================
++*/
++static void CG_LaunchRock( const vec3_t origin, const vec3_t velocity, int size, int life, qhandle_t material ) {
++	localEntity_t	*le;
++	refEntity_t		*re;
++	int				i;
++
++	le = CG_AllocLocalEntity();
++	re = &le->refEntity;
++
++	le->leType = LE_FRAGMENT;
++	le->leFlags = LEF_TUMBLE | LEF_ROCK;
++	le->startTime = cg.time;
++	le->endTime = cg.time + life;
++	le->radius = size;
++
++	VectorCopy( origin, re->origin );
++	if ( size < 0 ) {
++		re->hModel = cgs.media.rocketGravelModels[rand() % NUM_ROCKET_GRAVEL];
++	} else {
++		re->hModel = cgs.media.rocketChunkModels[size];
++	}
++	re->customShader = material;
++	// dozens of rocks can be lying around; casting shadows they cost more than they show
++	re->renderfx = RF_NOSHADOW;
++
++	le->pos.trType = TR_GRAVITY;
++	VectorCopy( origin, le->pos.trBase );
++	VectorCopy( velocity, le->pos.trDelta );
++	le->pos.trTime = cg.time;
++
++	le->angles.trType = TR_LINEAR;
++	le->angles.trTime = cg.time;
++	for ( i = 0 ; i < 3 ; i++ ) {
++		le->angles.trBase[i] = random() * 360;
++		le->angles.trDelta[i] = crandom() * ( size < 0 ? 1080 : 720 );
++	}
++	AnglesToAxis( le->angles.trBase, re->axis );
++
++	le->bounceFactor = 0.3f + random() * 0.2f;
++	le->leMarkType = LEMT_NONE;
++	le->leBounceSoundType = size >= 2 ? LEBS_ROCK : LEBS_NONE;
++	if ( size >= 3 ) {
++		le->leFlags |= LEF_SHATTER;
++	}
++}
++
++/*
++==================
++CG_RubbleLife
++
++How long a rock lies about before it sinks away: chunks long enough to leave the floor strewn with rubble, the biggest longest, and gravel only briefly
++==================
++*/
++static int CG_RubbleLife( int size ) {
++	if ( size < 0 ) {
++		return 3000 + random() * 2500;
++	}
++	return 1000 * MAX( cg_rubbleTime.value, 2 ) * ( 0.75f + 0.5f * random() ) * ( 0.8f + 0.1f * size );
++}
++
++/*
++==================
++CG_Smoke
++
++A thick puff of smoke or dust. It slows down in the air, rises, swirls and spreads out under ceilings, lit by the level around it and, while it is young, glowing from the fire it came out of.
++==================
++*/
++localEntity_t *CG_Smoke( const vec3_t origin, const vec3_t velocity, float radius, float endRadius,
++	const vec3_t color, float alpha, int delay, int duration, float fireGlow ) {
++	localEntity_t	*le;
++	trace_t			tr;
++	vec3_t			end;
++
++	le = CG_AllocLocalEntity();
++	le->leType = LE_SMOKE;
++	le->startTime = cg.time + delay;
++	le->endTime = le->startTime + duration;
++	le->lifeRate = 1.0f / duration;
++	VectorCopy( origin, le->pos.trBase );
++	VectorCopy( velocity, le->pos.trDelta );
++	le->radius = radius;
++	le->endRadius = endRadius;
++	VectorCopy( color, le->color );
++	le->color[3] = alpha;
++	le->light = fireGlow;
++
++	le->angles.trBase[0] = random() * 360;
++	le->angles.trDelta[0] = crandom() * 12;
++	le->angles.trBase[2] = random() * 2 * M_PI;		// where it is in its swirl
++
++	// the ceiling it will spread out under
++	VectorCopy( origin, end );
++	end[2] += 1024;
++	CG_Trace( &tr, origin, NULL, NULL, end, -1, CONTENTS_SOLID );
++	le->angles.trBase[1] = tr.endpos[2];
++
++	le->refEntity.reType = RT_SPRITE;
++	le->refEntity.customShader = cgs.media.thickSmokeShaders[rand() % NUM_SMOKE_SHADERS];
++	return le;
++}
++
++void CG_AddSmoke( localEntity_t *le ) {
++	refEntity_t	*re;
++	vec3_t		ambient, directed, lightDir, flat;
++	float		dt, t, c, r, a, lit, glow, ceiling;
++	int			i;
++
++	if ( cg.time < le->startTime ) {
++		return;
++	}
++	re = &le->refEntity;
++	dt = MIN( cg.frametime * 0.001f, 0.05f );
++	t = ( cg.time - le->startTime ) * 0.001f;
++	c = ( cg.time - le->startTime ) * le->lifeRate;
++	r = le->radius + ( le->endRadius - le->radius ) * ( 1 - ( 1 - c ) * ( 1 - c ) );
++
++	// the air slows it down, its heat lifts it and it swirls about
++	VectorScale( le->pos.trDelta, 1 - MIN( 1.6f * dt, 0.5f ), le->pos.trDelta );
++	le->pos.trDelta[2] += 34 * dt;
++	le->pos.trDelta[0] += 14 * dt * sin( t * 1.3f + le->angles.trBase[2] );
++	le->pos.trDelta[1] += 14 * dt * cos( t * 1.1f + le->angles.trBase[2] * 1.7f );
++	VectorMA( le->pos.trBase, dt, le->pos.trDelta, le->pos.trBase );
++
++	// under a ceiling it rolls out sideways instead
++	ceiling = le->angles.trBase[1] - r * 0.35f;
++	if ( le->pos.trBase[2] > ceiling ) {
++		le->pos.trBase[2] = ceiling;
++		if ( le->pos.trDelta[2] > 0 ) {
++			VectorSet( flat, le->pos.trDelta[0], le->pos.trDelta[1], 0 );
++			if ( VectorNormalize( flat ) < 1 ) {
++				VectorSet( flat, cos( le->angles.trBase[2] ), sin( le->angles.trBase[2] ), 0 );
++			}
++			VectorMA( le->pos.trDelta, le->pos.trDelta[2] * 0.7f, flat, le->pos.trDelta );
++			le->pos.trDelta[2] = 0;
++		}
++	}
++
++	// lit by the level, mostly from above
++	if ( trap_R_LightForPoint( le->pos.trBase, ambient, directed, lightDir ) ) {
++		lit = 0.6f + 0.4f * MAX( lightDir[2], 0 );
++		for ( i = 0 ; i < 3 ; i++ ) {
++			ambient[i] = Com_Clamp( 0.12f, 1.3f, ( ambient[i] + directed[i] * lit * 0.6f ) / 200.0f );
++		}
++	} else {
++		VectorSet( ambient, 0.8f, 0.8f, 0.8f );
++	}
++
++	// and by the fire for a moment
++	glow = t < 0.4f ? le->light * ( 1 - t / 0.4f ) * ( 1 - t / 0.4f ) : 0;
++
++	a = le->color[3] * MIN( t / 0.12f, 1 ) * ( 1 - c ) * ( 1 - c );
++	re->shaderRGBA[0] = 255 * Com_Clamp( 0, 1, le->color[0] * ambient[0] + glow );
++	re->shaderRGBA[1] = 255 * Com_Clamp( 0, 1, le->color[1] * ambient[1] + glow * 0.45f );
++	re->shaderRGBA[2] = 255 * Com_Clamp( 0, 1, le->color[2] * ambient[2] + glow * 0.12f );
++	re->shaderRGBA[3] = 255 * Com_Clamp( 0, 1, a );
++
++	VectorCopy( le->pos.trBase, re->origin );
++	re->radius = r;
++	re->rotation = le->angles.trBase[0] + le->angles.trDelta[0] * t;
++	trap_R_AddRefEntityToScene( re );
++}
++
++static void CG_RockDust( const vec3_t origin, const vec3_t velocity, float radius, float alpha, int duration ) {
++	vec3_t	color = { 0.5f, 0.46f, 0.4f };
++
++	CG_Smoke( origin, velocity, radius * 0.45f, radius * 1.3f, color, alpha, 0, duration, 0 );
++}
++
++// the plane of a blasted surface: side runs along it, up is as near world up as it gets
++static void CG_BlastPlane( const vec3_t dir, vec3_t side, vec3_t up ) {
++	vec3_t	worldUp = { 0, 0, 1 };
++
++	if ( fabs( dir[2] ) < 0.7f ) {
++		CrossProduct( dir, worldUp, side );
++		VectorNormalize( side );
++	} else {
++		PerpendicularVector( side, dir );
++	}
++	CrossProduct( side, dir, up );
++}
++
++void CG_FragmentBounceSound( localEntity_t *le, trace_t *trace );
++void CG_ReflectVelocity( localEntity_t *le, trace_t *trace );
++
++/*
++==================
++CG_ShatterChunk
++
++A big rock hitting something: it breaks into smaller ones if it hits hard, otherwise it just bounces
++==================
++*/
++void CG_ShatterChunk( localEntity_t *le, const trace_t *trace ) {
++	trace_t	tr;
++	vec3_t	velocity, bounce, start, v;
++	float	speed, dot;
++	int		hitTime, size, life, i, count;
++	qhandle_t	material;
++
++	tr = *trace;
++	hitTime = cg.time - cg.frametime + cg.frametime * tr.fraction;
++	BG_EvaluateTrajectoryDelta( &le->pos, hitTime, velocity );
++	speed = VectorLength( velocity );
++	le->leFlags &= ~LEF_SHATTER;
++	if ( speed < 220 || tr.allsolid ) {
++		CG_FragmentBounceSound( le, &tr );
++		CG_ReflectVelocity( le, &tr );
++		trap_R_AddRefEntityToScene( &le->refEntity );
++		return;
++	}
++
++	// making room for the pieces must not clear away this one
++	le->leFlags &= ~LEF_ROCK;
++	count = 3 + rand() % 3;
++	CG_MakeRoomForRocks( count );
++
++	size = le->radius;
++	life = le->endTime - cg.time;
++	dot = DotProduct( velocity, tr.plane.normal );
++	VectorMA( velocity, -2 * dot, tr.plane.normal, bounce );
++	VectorScale( bounce, 0.45f, bounce );
++	VectorMA( tr.endpos, 2, tr.plane.normal, start );
++	if ( cg.time - le->startTime < ROCK_SOUND_TIME ) {
++		CG_RockSound( tr.endpos );
++	}
++
++	// free it first: spawning the pieces may need its slot
++	material = le->refEntity.customShader;
++	CG_FreeLocalEntity( le );
++
++	for ( i = 0 ; i < count ; i++ ) {
++		VectorCopy( bounce, v );
++		v[0] += crandom() * 140;
++		v[1] += crandom() * 140;
++		v[2] += crandom() * 80;
++		VectorMA( v, 40 + random() * 120, tr.plane.normal, v );
++		CG_LaunchRock( start, v, i == 0 ? size - 2 : ( i == 1 ? size - 3 : -1 ), i < 2 ? life : CG_RubbleLife( -1 ), material );
++	}
++
++	VectorScale( tr.plane.normal, 15, v );
++	CG_RockDust( start, v, 12 + random() * 8, 0.4f, 900 + random() * 400 );
++}
++
++/*
++==================
++CG_RockSpray
++
++A cone of rocks thrown out from origin along dir
++==================
++*/
++static void CG_RockSpray( const vec3_t origin, const vec3_t dir, int chunks, int gravel, float speed, qhandle_t material ) {
++	vec3_t	velocity;
++	int		i, size;
++
++	CG_MakeRoomForRocks( chunks );
++	for ( i = 0 ; i < chunks ; i++ ) {
++		VectorScale( dir, speed * ( 0.4f + random() * 0.8f ), velocity );
++		velocity[0] += crandom() * 220;
++		velocity[1] += crandom() * 220;
++		velocity[2] += 120 + crandom() * 200;
++
++		// mostly small chunks, now and then a big one
++		size = (int)( random() * random() * NUM_ROCKET_CHUNKS );
++		CG_LaunchRock( origin, velocity, size, CG_RubbleLife( size ), material );
++	}
++
++	CG_MakeRoomForRocks( gravel );
++	for ( i = 0 ; i < gravel ; i++ ) {
++		VectorScale( dir, speed * ( 0.6f + random() * 1.0f ), velocity );
++		velocity[0] += crandom() * 320;
++		velocity[1] += crandom() * 320;
++		velocity[2] += 150 + crandom() * 260;
++		CG_LaunchRock( origin, velocity, -1, CG_RubbleLife( -1 ), material );
++	}
++}
++
++/*
++==================
++CG_CraterFloor
++
++Where the crater blasted at origin is, a and b units across the surface from its middle, found by tracing in from in front of the wall. Returns qfalse if nothing solid is there.
++==================
++*/
++static qboolean CG_CraterFloor( const vec3_t origin, const vec3_t dir, float a, float b, vec3_t spot ) {
++	trace_t	tr;
++	vec3_t	side, up, start, end;
++
++	CG_BlastPlane( dir, side, up );
++	VectorMA( origin, 8, dir, start );
++	VectorMA( start, a, side, start );
++	VectorMA( start, b, up, start );
++	VectorMA( start, -80, dir, end );
++	CG_Trace( &tr, start, NULL, NULL, end, -1, CONTENTS_SOLID );
++	if ( tr.startsolid || tr.fraction == 1.0f ) {
++		VectorCopy( origin, spot );
++		return qfalse;
++	}
++	VectorMA( tr.endpos, 1, tr.plane.normal, spot );
++	return qtrue;
++}
++
++/*
++==================
++CG_CraterEmbers
++
++Bits of burning rock left glowing on the floor of a fresh crater
++==================
++*/
++static void CG_CraterEmbers( const vec3_t origin, const vec3_t dir ) {
++	localEntity_t	*le;
++	vec3_t			spot;
++	int				i, count;
++
++	count = 12 + rand() % 7;
++	for ( i = 0 ; i < count ; i++ ) {
++		if ( !CG_CraterFloor( origin, dir, crandom() * 20, crandom() * 20, spot ) ) {
++			continue;
++		}
++		le = CG_AllocLocalEntity();
++		le->leType = LE_EMBER;
++		le->startTime = cg.time;
++		le->endTime = cg.time + 3500 + random() * 5000;
++		le->lifeRate = 1.0f / ( le->endTime - le->startTime );
++		le->radius = 1.2f + random() * 1.6f;
++		le->color[0] = 0.7f + random() * 0.5f;		// how hot it starts
++		le->color[1] = 0.5f + random();				// how fast it flickers
++		le->color[2] = random() * 2 * M_PI;
++		VectorCopy( spot, le->refEntity.origin );
++		le->refEntity.reType = RT_SPRITE;
++		le->refEntity.customShader = cgs.media.emberShader;
++		le->refEntity.rotation = random() * 360;
++	}
++}
++
++void CG_AddEmber( localEntity_t *le ) {
++	refEntity_t	*re;
++	float		c, heat;
++
++	re = &le->refEntity;
++	c = ( cg.time - le->startTime ) * le->lifeRate;
++	heat = le->color[0] * ( 1 - c ) * ( 0.7f + 0.3f * sin( cg.time * 0.012f * le->color[1] + le->color[2] ) );
++
++	re->radius = le->radius * ( 0.5f + 0.5f * ( 1 - c ) );
++	re->shaderRGBA[0] = 255 * Com_Clamp( 0, 1, heat * 1.4f );
++	re->shaderRGBA[1] = 255 * Com_Clamp( 0, 1, heat * heat * 0.7f );
++	re->shaderRGBA[2] = 255 * Com_Clamp( 0, 1, heat * heat * heat * heat * 0.3f );
++	re->shaderRGBA[3] = 255;
++	trap_R_AddRefEntityToScene( re );
++}
++
++void CG_AddSmokeColumn( localEntity_t *le ) {
++	vec3_t	side, up, start, velocity, color;
++	float	c, shade;
++
++	// fadeInTime is when the next puff comes out
++	CG_BlastPlane( le->pos.trDelta, side, up );
++	while ( cg.time >= le->fadeInTime && le->fadeInTime < le->endTime ) {
++		c = ( le->fadeInTime - le->startTime ) * le->lifeRate;
++
++		VectorMA( le->pos.trBase, 2 + random() * 6, le->pos.trDelta, start );
++		VectorMA( start, crandom() * 6, side, start );
++		VectorMA( start, crandom() * 6, up, start );
++
++		VectorScale( le->pos.trDelta, 25 + random() * 25, velocity );
++		VectorMA( velocity, crandom() * 8, side, velocity );
++		velocity[2] += 15 + random() * 20;
++
++		shade = 0.2f + 0.1f * random();
++		VectorSet( color, shade, shade * 0.96f, shade * 0.92f );
++		CG_Smoke( start, velocity, 12 + random() * 6, 52 + random() * 28 + 30 * c, color,
++			0.2f + 0.6f * ( 1 - c ), le->fadeInTime - cg.time, 900 + random() * 400, 0.35f * ( 1 - c ) );
++
++		// thinning out as it burns down
++		le->fadeInTime += 60 + 120 * c;
++	}
++}
++
++// a puff of fire thrown out of a blast, see CG_AddFireball
++static localEntity_t *CG_Flame( const vec3_t origin, const vec3_t velocity, float radius, float endRadius,
++	int delay, int duration, qhandle_t shader ) {
++	localEntity_t	*le;
++
++	le = CG_AllocLocalEntity();
++	le->leType = LE_FIREBALL;
++	le->startTime = cg.time + delay;
++	le->endTime = le->startTime + duration;
++	le->lifeRate = 1.0f / duration;
++	VectorCopy( origin, le->pos.trBase );
++	VectorCopy( velocity, le->pos.trDelta );
++	le->radius = radius;
++	le->endRadius = endRadius;
++	le->color[0] = 1;		// heat
++	le->color[3] = 1;		// brightness
++	le->angles.trBase[0] = random() * 360;
++	le->angles.trDelta[0] = crandom() * 90;
++	le->refEntity.reType = RT_SPRITE;
++	le->refEntity.customShader = shader;
++	return le;
++}
++
++/*
++==================
++CG_RocketFireball
++
++A rolling ball of fire around a rocket blast: a white hot flash that lights up the room and jolts the view, flames bursting out and slowing down as they cool, a shock ring across the surface it hit, rubble lying nearby thrown about and dark smoke left hanging where it was
++==================
++*/
++void CG_RocketFireball( vec3_t origin, vec3_t dir, qboolean onSurface ) {
++	localEntity_t	*le;
++	vec3_t			side, up, start, v, color;
++	float			d;
++	int				i, count;
++
++	CG_BlastPlane( dir, side, up );
++
++	// white hot flash
++	VectorMA( origin, 10, dir, start );
++	VectorClear( v );
++	le = CG_Flame( start, v, 20, 72, 0, 220, cgs.media.emberShader );
++	le->color[3] = 1.6f;
++
++	le = CG_AllocLocalEntity();
++	le->leType = LE_FLASH;
++	le->startTime = cg.time;
++	le->endTime = cg.time + 400;
++	le->light = 750;
++	VectorMA( origin, 24, dir, le->pos.trBase );
++
++	CG_ShakeView( origin, 1 );
++	CG_StirRocks( origin, 170, 520 );
++
++	// flames bursting out, away from the surface
++	count = 12 + rand() % 5;
++	for ( i = 0 ; i < count ; i++ ) {
++		v[0] = crandom();
++		v[1] = crandom();
++		v[2] = crandom();
++		VectorNormalize( v );
++		if ( onSurface ) {
++			d = DotProduct( v, dir );
++			if ( d < 0 ) {
++				VectorMA( v, -2 * d, dir, v );
++			}
++			VectorMA( v, 0.35f, dir, v );
++			VectorNormalize( v );
++		}
++		VectorMA( origin, 6, dir, start );
++		VectorScale( v, 140 + random() * 280, v );
++		le = CG_Flame( start, v, 8 + random() * 6, 24 + random() * 20, rand() % 50, 420 + random() * 480,
++			cgs.media.fireballShader );
++		le->color[0] = 0.8f;
++		le->color[3] = 0.45f + 0.25f * random();
++	}
++
++	// a shock ring racing out across the surface
++	if ( onSurface ) {
++		le = CG_AllocLocalEntity();
++		le->leType = LE_SHOCKWAVE;
++		le->startTime = cg.time;
++		le->endTime = cg.time + 320;
++		le->lifeRate = 1.0f / ( le->endTime - le->startTime );
++		VectorMA( origin, 1.5f, dir, le->pos.trBase );
++		VectorCopy( dir, le->pos.trDelta );
++		le->radius = 130;
++	}
++
++	// thick smoke left rolling where the fire was, lit by it from inside
++	for ( i = 0 ; i < 10 ; i++ ) {
++		VectorMA( origin, 14 + random() * 18, dir, start );
++		VectorMA( start, crandom() * 18, side, start );
++		VectorMA( start, crandom() * 18, up, start );
++		VectorScale( dir, 20 + random() * 40, v );
++		VectorMA( v, crandom() * 45, side, v );
++		VectorMA( v, crandom() * 30, up, v );
++		d = 0.18f + 0.1f * random();
++		VectorSet( color, d, d * 0.97f, d * 0.94f );
++		CG_Smoke( start, v, 22 + random() * 10, 70 + random() * 30, color, 0.8f,
++			60 + rand() % 100, 900 + random() * 400, 0.9f );
++	}
++}
++
++// the room lit up for a moment, white then fading through orange
++void CG_AddFlash( localEntity_t *le ) {
++	float	t, k;
++
++	t = cg.time - le->startTime;
++	k = t < 40 ? 1 : 1 / ( 1 + ( t - 40 ) * ( t - 40 ) / 3600.0f );
++	trap_R_AddLightToScene( le->pos.trBase, le->light * ( 0.4f + 0.6f * k ), k * 1.6f, k * ( 0.6f + 0.6f * k ), k * k * 0.9f );
++}
++
++void CG_AddFireball( localEntity_t *le ) {
++	refEntity_t	*re;
++	float		t, c, heat, fade;
++
++	if ( cg.time < le->startTime ) {
++		return;
++	}
++	re = &le->refEntity;
++	t = ( cg.time - le->startTime ) * 0.001f;
++	c = ( cg.time - le->startTime ) * le->lifeRate;
++
++	// thrown out fast, slowing down in the air as it grows
++	VectorMA( le->pos.trBase, t / ( 1 + 6 * t ), le->pos.trDelta, re->origin );
++	re->radius = le->radius + ( le->endRadius - le->radius ) * 9 * t / ( 1 + 9 * t );
++	re->rotation = le->angles.trBase[0] + le->angles.trDelta[0] * t;
++
++	// white, then yellow, orange and a dull red as it burns out
++	heat = le->color[0] * ( 1 - c );
++	fade = le->color[3] * ( 1 - c ) * ( 1 - c );
++	re->shaderRGBA[0] = 255 * Com_Clamp( 0, 1, fade );
++	re->shaderRGBA[1] = 255 * Com_Clamp( 0, 1, fade * ( 0.22f + 0.6f * heat ) );
++	re->shaderRGBA[2] = 255 * Com_Clamp( 0, 1, fade * ( 0.03f + 0.55f * heat * heat * heat ) );
++	re->shaderRGBA[3] = 255;
++	trap_R_AddRefEntityToScene( re );
++}
++
++void CG_AddShockwave( localEntity_t *le ) {
++	polyVert_t	verts[4];
++	vec3_t		side, up;
++	float		c, r, a;
++	int			i;
++
++	c = ( cg.time - le->startTime ) * le->lifeRate;
++	r = le->radius * ( 1 - ( 1 - c ) * ( 1 - c ) * ( 1 - c ) ) + 8;
++	a = 0.55f * ( 1 - c ) * sqrt( 1 - c );
++
++	CG_BlastPlane( le->pos.trDelta, side, up );
++	for ( i = 0 ; i < 4 ; i++ ) {
++		VectorMA( le->pos.trBase, ( i == 0 || i == 3 ) ? -r : r, side, verts[i].xyz );
++		VectorMA( verts[i].xyz, ( i < 2 ) ? -r : r, up, verts[i].xyz );
++		verts[i].st[0] = ( i == 0 || i == 3 ) ? 0 : 1;
++		verts[i].st[1] = ( i < 2 ) ? 0 : 1;
++		verts[i].modulate[0] = 255 * a;
++		verts[i].modulate[1] = 210 * a;
++		verts[i].modulate[2] = 160 * a;
++		verts[i].modulate[3] = 255;
++	}
++	trap_R_AddPolyToScene( cgs.media.shockRingShader, 4, verts );
++}
++
++/*
++==================
++CG_RocketWallDamage
++
++Rock chunks, gravel, sparks and dust thrown out of a blasted wall, more falling off the crater's edge a moment later
++==================
++*/
++void CG_RocketWallDamage( vec3_t origin, vec3_t dir ) {
++	localEntity_t	*le;
++	vec3_t	start, velocity, side, up;
++	byte	color[4];
++	float	speed;
++	int		i, count;
++	qhandle_t	material;
++
++	// the rocks are of the wall's own stuff
++	material = trap_R_WallMaterial( origin, dir );
++
++	VectorMA( origin, 6, dir, start );
++	CG_RockSpray( start, dir, 12 + rand() % 6, 26 + rand() % 12, 380, material );
++
++	VectorMA( origin, 4, dir, start );
++	count = 8 + rand() % 5;
++	for ( i = 0 ; i < count ; i++ ) {
++		speed = 250 + random() * 350;
++		VectorScale( dir, speed, velocity );
++		velocity[0] += crandom() * 260;
++		velocity[1] += crandom() * 260;
++		velocity[2] += 60 + crandom() * 260;
++
++		color[0] = 255;
++		color[1] = 140 + random() * 60;
++		color[2] = 40;
++		color[3] = 255;
++
++		CG_LaunchDebris( start, velocity, cgs.media.rocketSparkShader,
++			1.0f + random(), color, 500 + random() * 600, 0.5f );
++	}
++
++	// a thick cloud of dust that rolls out and hangs in the air
++	CG_BlastPlane( dir, side, up );
++	for ( i = 0 ; i < 10 ; i++ ) {
++		VectorMA( origin, 6 + random() * 18, dir, start );
++		VectorMA( start, crandom() * 20, side, start );
++		VectorMA( start, crandom() * 20, up, start );
++
++		VectorScale( dir, 30 + random() * 60, velocity );
++		VectorMA( velocity, crandom() * 40, side, velocity );
++		VectorMA( velocity, crandom() * 30, up, velocity );
++		velocity[2] -= random() * 12;
++
++		CG_RockDust( start, velocity, 32 + random() * 28, 0.5f + random() * 0.15f, 800 + random() * 400 );
++	}
++
++	// the rock cracking and breaking up, under the bang of the rocket
++	trap_S_StartSound( origin, ENTITYNUM_WORLD, CHAN_AUTO, cgs.media.rockBlastSound );
++
++	// soot blown out across the surface, and cracks running out from the crater
++	CG_ImpactMark( cgs.media.rockSootShader, origin, dir, random() * 360, 1, 1, 1, 1, qfalse, 60 + random() * 16, qfalse );
++	CG_ImpactMark( cgs.media.rockCracksShader, origin, dir, random() * 360, 1, 1, 1, 1, qfalse, 76 + random() * 24, qfalse );
++
++	CG_CraterEmbers( origin, dir );
++
++	// smoke keeps pouring out of the crater for a while
++	le = CG_AllocLocalEntity();
++	le->leType = LE_SMOKE_COLUMN;
++	le->startTime = cg.time + 150;
++	le->endTime = le->startTime + 1000;
++	le->lifeRate = 1.0f / ( le->endTime - le->startTime );
++	le->fadeInTime = le->startTime;
++	CG_CraterFloor( origin, dir, 0, 0, le->pos.trBase );
++	VectorCopy( dir, le->pos.trDelta );
++
++	// the edge gives way a moment later, twice
++	for ( i = 0 ; i < 2 ; i++ ) {
++		le = CG_AllocLocalEntity();
++		le->leType = LE_CRUMBLE;
++		le->startTime = cg.time + ( i ? 1200 + random() * 500 : 450 + random() * 300 );
++		le->endTime = le->startTime + 100;
++		le->radius = 22 + random() * 10;
++		le->refEntity.customShader = material;
++		VectorCopy( origin, le->pos.trBase );
++		VectorCopy( dir, le->pos.trDelta );
++	}
++}
++
++/*
++==================
++CG_AddCrumble
++
++Rocks breaking off the edge of a fresh crater and trickling dust, piling up at the foot of the wall
++==================
++*/
++void CG_AddCrumble( localEntity_t *le ) {
++	vec3_t	origin, dir, side, up, start, velocity;
++	float	ang, r;
++	int		i, count, size;
++	qhandle_t	material;
++
++	if ( cg.time < le->startTime ) {
++		return;
++	}
++	VectorCopy( le->pos.trBase, origin );
++	VectorCopy( le->pos.trDelta, dir );
++	r = le->radius;
++	material = le->refEntity.customShader;
++	CG_FreeLocalEntity( le );
++
++	CG_BlastPlane( dir, side, up );
++	count = 6 + rand() % 4;
++	CG_MakeRoomForRocks( count );
++	for ( i = 0 ; i < count ; i++ ) {
++		// on walls the rocks come off the top of the crater
++		if ( fabs( dir[2] ) < 0.7f ) {
++			ang = M_PI * ( 0.1f + 0.8f * random() );
++		} else {
++			ang = 2 * M_PI * random();
++		}
++		VectorMA( origin, 3, dir, start );
++		VectorMA( start, r * cos( ang ), side, start );
++		VectorMA( start, r * sin( ang ), up, start );
++
++		VectorScale( dir, 15 + random() * 45, velocity );
++		VectorMA( velocity, -r * cos( ang ) * 0.8f, side, velocity );
++		VectorMA( velocity, -r * sin( ang ) * 0.8f, up, velocity );
++		size = ( rand() % 2 ) ? -1 : rand() % 4;
++		CG_LaunchRock( start, velocity, size, CG_RubbleLife( size ), material );
++	}
++
++	for ( i = 0 ; i < 4 ; i++ ) {
++		ang = 2 * M_PI * random();
++		VectorMA( origin, 4 + random() * 6, dir, start );
++		VectorMA( start, r * cos( ang ), side, start );
++		VectorMA( start, r * sin( ang ), up, start );
++		VectorSet( velocity, crandom() * 6, crandom() * 6, -12 - random() * 18 );
++		CG_RockDust( start, velocity, 14 + random() * 12, 0.35f, 900 + random() * 400 );
++	}
++}
++
+ /*
+ ==================
+ CG_SpawnEffect
+@@ -716,3 +1469,99 @@ void CG_BigExplode( vec3_t playerOrigin ) {
+ 	CG_LaunchExplode( origin, velocity, cgs.media.smoke2 );
+ }
+ 
++/*
++==================
++CG_ShotWallDamage
++
++What smaller shots knock out of a wall: bullets and pellets kick out sparks, grit and a puff of dust, rails blast a ring of soot and cracks with a shower of white sparks, plasma spits molten drops and a hiss of steam
++==================
++*/
++void CG_ShotWallDamage( int weapon, vec3_t origin, vec3_t dir ) {
++	vec3_t	start, velocity, side, up;
++	vec3_t	steam = { 0.62f, 0.66f, 0.72f };
++	byte	color[4];
++	int		i, sparks, gravel, puffs;
++	float	speed, spread;
++	qhandle_t	material;
++
++	CG_BlastPlane( dir, side, up );
++	VectorMA( origin, 2, dir, start );
++
++	switch ( weapon ) {
++	case WP_MACHINEGUN:
++		sparks = 2 + rand() % 2;
++		gravel = 1 + rand() % 2;
++		puffs = 1;
++		break;
++	case WP_SHOTGUN:
++		sparks = 1;
++		gravel = ( rand() % 5 < 2 ) ? 1 : 0;
++		puffs = 1;
++		break;
++	case WP_RAILGUN:
++		sparks = 10 + rand() % 5;
++		gravel = 3 + rand() % 3;
++		puffs = 3;
++		CG_ImpactMark( cgs.media.rockSootShader, origin, dir, random() * 360, 1, 1, 1, 1, qfalse, 14 + random() * 4, qfalse );
++		CG_ImpactMark( cgs.media.rockCracksShader, origin, dir, random() * 360, 1, 1, 1, 1, qfalse, 22 + random() * 8, qfalse );
++		break;
++	case WP_PLASMAGUN:
++		sparks = 5 + rand() % 3;
++		gravel = 0;
++		puffs = 2;
++		break;
++	default:
++		return;
++	}
++
++	for ( i = 0 ; i < sparks ; i++ ) {
++		speed = weapon == WP_RAILGUN ? 250 + random() * 300 : 120 + random() * 200;
++		spread = weapon == WP_PLASMAGUN ? 90 : 160;
++		VectorScale( dir, speed, velocity );
++		VectorMA( velocity, crandom() * spread, side, velocity );
++		VectorMA( velocity, crandom() * spread, up, velocity );
++		if ( weapon == WP_RAILGUN ) {
++			color[0] = 200 + rand() % 56;
++			color[1] = 220 + rand() % 36;
++			color[2] = 255;
++		} else if ( weapon == WP_PLASMAGUN ) {
++			// molten drops, dripping as they cool
++			color[0] = 90 + rand() % 60;
++			color[1] = 160 + rand() % 60;
++			color[2] = 255;
++			velocity[2] += 40;
++		} else {
++			color[0] = 255;
++			color[1] = 170 + rand() % 60;
++			color[2] = 60;
++		}
++		color[3] = 255;
++		CG_LaunchDebris( start, velocity, cgs.media.rocketSparkShader,
++			weapon == WP_PLASMAGUN ? 1.2f + random() * 0.8f : 0.6f + random() * 0.6f, color,
++			weapon == WP_PLASMAGUN ? 600 + random() * 500 : 200 + random() * 300,
++			weapon == WP_PLASMAGUN ? 0.2f : 0.5f );
++	}
++
++	if ( gravel ) {
++		CG_MakeRoomForRocks( gravel );
++	}
++	material = gravel ? trap_R_WallMaterial( origin, dir ) : 0;
++	for ( i = 0 ; i < gravel ; i++ ) {
++		VectorScale( dir, 80 + random() * 140, velocity );
++		VectorMA( velocity, crandom() * 90, side, velocity );
++		VectorMA( velocity, crandom() * 90, up, velocity );
++		CG_LaunchRock( start, velocity, -1, 1500 + random() * 1500, material );
++	}
++
++	for ( i = 0 ; i < puffs ; i++ ) {
++		VectorMA( origin, 4 + random() * 4, dir, start );
++		VectorScale( dir, 15 + random() * 25, velocity );
++		VectorMA( velocity, crandom() * 10, side, velocity );
++		if ( weapon == WP_PLASMAGUN ) {
++			CG_Smoke( start, velocity, 5, 22 + random() * 8, steam, 0.35f, 0, 700 + random() * 400, 0 );
++		} else {
++			CG_RockDust( start, velocity, weapon == WP_RAILGUN ? 26 + random() * 12 : 14 + random() * 6,
++				weapon == WP_RAILGUN ? 0.45f : 0.35f, weapon == WP_RAILGUN ? 1600 + random() * 800 : 700 + random() * 500 );
++		}
++	}
++}
+diff --git a/code/cgame/cg_local.h b/code/cgame/cg_local.h
+index 6546d4d51f9573d1dff9ffda5f3dbcfb5d77d8db..f8bb01dcaee4d66ed210090d3c52bd18219557c0 100644
+--- a/code/cgame/cg_local.h
++++ b/code/cgame/cg_local.h
+@@ -59,6 +59,14 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ 
+ #define	MAX_VERTS_ON_POLY	10
+ #define	MAX_MARK_POLYS		256
++#define	NUM_ROCKET_CHUNKS	6		// rock chunk models, smallest first
++#define	NUM_ROCKET_GRAVEL	3		// gravel models, smallest first
++#define	NUM_SMOKE_SHADERS	3
++#define	NUM_ROCK_SOUNDS		6
++#define	ROCK_SOUND_TIME		1000	// msec after it flies off that a rock still knocks when it lands
++#define	MAX_ROCK_DEBRIS		300		// rocks around at once, out of MAX_LOCAL_ENTITIES and MAX_REFENTITIES
++#define	ROCK_SINK_DEPTH		24		// how far rocks sink into the floor as they go
++#define	SHAKE_TIME			450		// msec a blast shakes the view for
+ 
+ #define STAT_MINUS			10	// num frame for '-' stats digit
+ 
+@@ -221,6 +229,13 @@ typedef enum {
+ 	LE_FADE_RGB,
+ 	LE_SCALE_FADE,
+ 	LE_SCOREPLUM,
++	LE_CRUMBLE,
++	LE_FIREBALL,
++	LE_SHOCKWAVE,
++	LE_SMOKE_COLUMN,
++	LE_EMBER,
++	LE_SMOKE,
++	LE_FLASH,
+ #ifdef MISSIONPACK
+ 	LE_KAMIKAZE,
+ 	LE_INVULIMPACT,
+@@ -233,7 +248,9 @@ typedef enum {
+ 	LEF_PUFF_DONT_SCALE  = 0x0001,			// do not scale size over time
+ 	LEF_TUMBLE			 = 0x0002,			// tumble over time, used for ejecting shells
+ 	LEF_SOUND1			 = 0x0004,			// sound 1 for kamikaze
+-	LEF_SOUND2			 = 0x0008			// sound 2 for kamikaze
++	LEF_SOUND2			 = 0x0008,			// sound 2 for kamikaze
++	LEF_ROCK			 = 0x0010,			// rock debris from a blasted wall
++	LEF_SHATTER			 = 0x0020			// breaks up on its first hard bounce
+ } leFlag_t;
+ 
+ typedef enum {
+@@ -245,7 +262,8 @@ typedef enum {
+ typedef enum {
+ 	LEBS_NONE,
+ 	LEBS_BLOOD,
+-	LEBS_BRASS
++	LEBS_BRASS,
++	LEBS_ROCK
+ } leBounceSoundType_t;	// fragment local entities can make sounds on impacts
+ 
+ typedef struct localEntity_s {
+@@ -267,6 +285,7 @@ typedef struct localEntity_s {
+ 	float			color[4];
+ 
+ 	float			radius;
++	float			endRadius;			// fireballs grow to this
+ 
+ 	float			light;
+ 	vec3_t			lightColor;
+@@ -632,6 +651,11 @@ typedef struct {
+ 	float		xyspeed;
+ 	int     nextOrbitTime;
+ 
++	// blasts nearby shaking the view
++	int			shakeTime;
++	float		shakeAmount;
++	float		shakePhase[3];
++
+ 	//qboolean cameraMode;		// if rendering from a loaded camera
+ 
+ 
+@@ -757,6 +781,19 @@ typedef struct {
+ 	qhandle_t	holeMarkShader;
+ 	qhandle_t	energyMarkShader;
+ 
++	// rocket wall damage
++	qhandle_t	rocketSparkShader;
++	qhandle_t	rocketChunkModels[NUM_ROCKET_CHUNKS];
++	qhandle_t	rocketGravelModels[NUM_ROCKET_GRAVEL];
++	sfxHandle_t	rockSounds[NUM_ROCK_SOUNDS];
++	sfxHandle_t	rockBlastSound;
++	qhandle_t	fireballShader;
++	qhandle_t	thickSmokeShaders[NUM_SMOKE_SHADERS];
++	qhandle_t	emberShader;
++	qhandle_t	shockRingShader;
++	qhandle_t	rockSootShader;
++	qhandle_t	rockCracksShader;
++
+ 	// powerup shaders
+ 	qhandle_t	quadShader;
+ 	qhandle_t	redQuadShader;
+@@ -1176,6 +1213,9 @@ extern	vmCvar_t		cg_noTaunt;
+ extern	vmCvar_t		cg_noProjectileTrail;
+ extern	vmCvar_t		cg_oldRail;
+ extern	vmCvar_t		cg_oldRocket;
++extern	vmCvar_t		cg_destruction;
++extern	vmCvar_t		cg_shake;
++extern	vmCvar_t		cg_rubbleTime;
+ extern	vmCvar_t		cg_oldPlasma;
+ extern	vmCvar_t		cg_trueLightning;
+ #ifdef MISSIONPACK
+@@ -1406,6 +1446,23 @@ localEntity_t *CG_SmokePuff( const vec3_t p,
+ 				   int leFlags,
+ 				   qhandle_t hShader );
+ void CG_BubbleTrail( vec3_t start, vec3_t end, float spacing );
++void CG_RocketWallDamage( vec3_t origin, vec3_t dir );
++void CG_ShotWallDamage( int weapon, vec3_t origin, vec3_t dir );
++void CG_ShatterChunk( localEntity_t *le, const trace_t *trace );
++void CG_AddCrumble( localEntity_t *le );
++void CG_RocketFireball( vec3_t origin, vec3_t dir, qboolean onSurface );
++void CG_AddFireball( localEntity_t *le );
++void CG_AddShockwave( localEntity_t *le );
++void CG_AddSmokeColumn( localEntity_t *le );
++void CG_AddEmber( localEntity_t *le );
++localEntity_t *CG_Smoke( const vec3_t origin, const vec3_t velocity, float radius, float endRadius,
++	const vec3_t color, float alpha, int delay, int duration, float fireGlow );
++void CG_AddSmoke( localEntity_t *le );
++void CG_MakeRoomForRocks( int count );
++void CG_RockSound( vec3_t origin );
++void CG_AddFlash( localEntity_t *le );
++void CG_ShakeView( const vec3_t origin, float amount );
++void CG_StirRocks( const vec3_t origin, float radius, float speed );
+ void CG_SpawnEffect( vec3_t org );
+ #ifdef MISSIONPACK
+ void CG_KamikazeEffect( vec3_t org );
+@@ -1508,6 +1565,9 @@ void		trap_FS_Write( const void *buffer, int len, fileHandle_t f );
+ void		trap_FS_FCloseFile( fileHandle_t f );
+ int			trap_FS_Seek( fileHandle_t f, long offset, int origin ); // fsOrigin_t
+ 
++// the textured, model-lit stuff of the wall that something hit at origin, 0 if unknown
++qhandle_t	trap_R_WallMaterial( const vec3_t origin, const vec3_t dir );
++
+ // add commands to the local console as if they were typed in
+ // for map changing, etc.  The command is not executed immediately,
+ // but will be executed in order the next time console commands
+diff --git a/code/cgame/cg_localents.c b/code/cgame/cg_localents.c
+index be61ce3188eb4aed0821db7d0f2eba890786781e..4a8cdf30c203a206961c03eead03af1684271669 100644
+--- a/code/cgame/cg_localents.c
++++ b/code/cgame/cg_localents.c
+@@ -26,10 +26,11 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ 
+ #include "cg_local.h"
+ 
+-#define	MAX_LOCAL_ENTITIES	512
++#define	MAX_LOCAL_ENTITIES	1024
+ localEntity_t	cg_localEntities[MAX_LOCAL_ENTITIES];
+ localEntity_t	cg_activeLocalEntities;		// double linked list
+ localEntity_t	*cg_freeLocalEntities;		// single linked list
++static localEntity_t	*cg_nextLocalEntity;	// where CG_AddLocalEntities goes on from
+ 
+ /*
+ ===================
+@@ -61,6 +62,11 @@ void CG_FreeLocalEntity( localEntity_t *le ) {
+ 		CG_Error( "CG_FreeLocalEntity: not active" );
+ 	}
+ 
++	// effects free and allocate local entities in the middle of the walk
++	if ( le == cg_nextLocalEntity ) {
++		cg_nextLocalEntity = le->prev;
++	}
++
+ 	// remove from the doubly linked active list
+ 	le->prev->next = le->next;
+ 	le->next->prev = le->prev;
+@@ -197,6 +203,14 @@ void CG_FragmentBounceSound( localEntity_t *le, trace_t *trace ) {
+ 		}
+ 	} else if ( le->leBounceSoundType == LEBS_BRASS ) {
+ 
++	} else if ( le->leBounceSoundType == LEBS_ROCK ) {
++		vec3_t	velocity;
++
++		// only while the blast it came from is still going on, and not for a stone just rolling over
++		BG_EvaluateTrajectoryDelta( &le->pos, cg.time, velocity );
++		if ( cg.time - le->startTime < ROCK_SOUND_TIME && VectorLength( velocity ) > 120 ) {
++			CG_RockSound( trace->endpos );
++		}
+ 	}
+ 
+ 	// don't allow a fragment to make multiple bounce sounds,
+@@ -259,7 +273,7 @@ void CG_AddFragment( localEntity_t *le ) {
+ 			VectorCopy( le->refEntity.origin, le->refEntity.lightingOrigin );
+ 			le->refEntity.renderfx |= RF_LIGHTING_ORIGIN;
+ 			oldZ = le->refEntity.origin[2];
+-			le->refEntity.origin[2] -= 16 * ( 1.0 - (float)t / SINK_TIME );
++			le->refEntity.origin[2] -= ( ( le->leFlags & LEF_ROCK ) ? ROCK_SINK_DEPTH : 16 ) * ( 1.0 - (float)t / SINK_TIME );
+ 			trap_R_AddRefEntityToScene( &le->refEntity );
+ 			le->refEntity.origin[2] = oldZ;
+ 		} else {
+@@ -303,6 +317,12 @@ void CG_AddFragment( localEntity_t *le ) {
+ 		return;
+ 	}
+ 
++	// big rocks break up when they land hard
++	if ( le->leFlags & LEF_SHATTER ) {
++		CG_ShatterChunk( le, &trace );
++		return;
++	}
++
+ 	// leave a mark
+ 	CG_FragmentBounceMark( le, &trace );
+ 
+@@ -799,6 +819,91 @@ void CG_AddScorePlum( localEntity_t *le ) {
+ 
+ //==============================================================================
+ 
++/*
++===================
++CG_MakeRoomForRocks
++
++Clears away the rocks that have been lying around longest, gravel first, so that count more fit under MAX_ROCK_DEBRIS. Rocks lying still sink away, ones in the air go at once. They only run out of time here and are freed as the list is walked, since this can be called from the middle of that walk.
++===================
++*/
++void CG_MakeRoomForRocks( int count ) {
++	localEntity_t	*le;
++	int				rocks, pass;
++
++	rocks = 0;
++	for ( le = cg_activeLocalEntities.next ; le != &cg_activeLocalEntities ; le = le->next ) {
++		if ( ( le->leFlags & LEF_ROCK ) && le->endTime > cg.time + SINK_TIME ) {
++			rocks++;
++		}
++	}
++
++	// the newest are at the front of the list, so start from the back
++	for ( pass = 0 ; pass < 2 ; pass++ ) {
++		for ( le = cg_activeLocalEntities.prev ; le != &cg_activeLocalEntities && rocks + count > MAX_ROCK_DEBRIS ; le = le->prev ) {
++			if ( !( le->leFlags & LEF_ROCK ) || le->endTime <= cg.time + SINK_TIME || ( pass == 0 && le->radius >= 0 ) ) {
++				continue;
++			}
++			le->endTime = le->pos.trType == TR_STATIONARY ? cg.time + SINK_TIME : cg.time;
++			rocks--;
++		}
++	}
++}
++
++/*
++===================
++CG_StirRocks
++
++A blast at origin throws the rocks within radius about, the nearest hardest, rubble lying on the floor included
++===================
++*/
++void CG_StirRocks( const vec3_t origin, float radius, float speed ) {
++	localEntity_t	*le;
++	vec3_t			push, velocity;
++	float			d, f;
++	int				i;
++
++	for ( le = cg_activeLocalEntities.next ; le != &cg_activeLocalEntities ; le = le->next ) {
++		if ( !( le->leFlags & LEF_ROCK ) || le->endTime <= cg.time + SINK_TIME ) {
++			continue;
++		}
++		VectorSubtract( le->refEntity.origin, origin, push );
++		d = VectorNormalize( push );
++		if ( d >= radius ) {
++			continue;
++		}
++		if ( d < 1 ) {
++			VectorSet( push, 0, 0, 1 );
++		}
++		f = 1 - d / radius;
++
++		if ( le->pos.trType == TR_STATIONARY ) {
++			VectorClear( velocity );
++		} else {
++			BG_EvaluateTrajectoryDelta( &le->pos, cg.time, velocity );
++		}
++		VectorMA( velocity, speed * f * ( 0.6f + 0.4f * random() ), push, velocity );
++		velocity[0] += crandom() * 60 * f;
++		velocity[1] += crandom() * 60 * f;
++		velocity[2] += 60 + 160 * f;
++
++		le->pos.trType = TR_GRAVITY;
++		VectorCopy( le->refEntity.origin, le->pos.trBase );
++		le->pos.trBase[2] += 1;
++		VectorCopy( velocity, le->pos.trDelta );
++		le->pos.trTime = cg.time;
++
++		le->angles.trType = TR_LINEAR;
++		le->angles.trTime = cg.time;
++		for ( i = 0 ; i < 3 ; i++ ) {
++			le->angles.trBase[i] = random() * 360;
++			le->angles.trDelta[i] = crandom() * 720;
++		}
++
++		// knocks when they land again belong to this blast
++		le->startTime = cg.time;
++	}
++}
++
+ /*
+ ===================
+ CG_AddLocalEntities
+@@ -806,15 +911,15 @@ CG_AddLocalEntities
+ ===================
+ */
+ void CG_AddLocalEntities( void ) {
+-	localEntity_t	*le, *next;
++	localEntity_t	*le;
+ 
+ 	// walk the list backwards, so any new local entities generated
+ 	// (trails, marks, etc) will be present this frame
+ 	le = cg_activeLocalEntities.prev;
+-	for ( ; le != &cg_activeLocalEntities ; le = next ) {
++	for ( ; le != &cg_activeLocalEntities ; le = cg_nextLocalEntity ) {
+ 		// grab next now, so if the local entity is freed we
+ 		// still have it
+-		next = le->prev;
++		cg_nextLocalEntity = le->prev;
+ 
+ 		if ( cg.time >= le->endTime ) {
+ 			CG_FreeLocalEntity( le );
+@@ -860,6 +965,34 @@ void CG_AddLocalEntities( void ) {
+ 			CG_AddScorePlum( le );
+ 			break;
+ 
++		case LE_CRUMBLE:
++			CG_AddCrumble( le );
++			break;
++
++		case LE_FIREBALL:
++			CG_AddFireball( le );
++			break;
++
++		case LE_SHOCKWAVE:
++			CG_AddShockwave( le );
++			break;
++
++		case LE_SMOKE_COLUMN:
++			CG_AddSmokeColumn( le );
++			break;
++
++		case LE_EMBER:
++			CG_AddEmber( le );
++			break;
++
++		case LE_SMOKE:
++			CG_AddSmoke( le );
++			break;
++
++		case LE_FLASH:
++			CG_AddFlash( le );
++			break;
++
+ #ifdef MISSIONPACK
+ 		case LE_KAMIKAZE:
+ 			CG_AddKamikaze( le );
+@@ -876,6 +1009,7 @@ void CG_AddLocalEntities( void ) {
+ #endif
+ 		}
+ 	}
++	cg_nextLocalEntity = NULL;
+ }
+ 
+ 
+diff --git a/code/cgame/cg_main.c b/code/cgame/cg_main.c
+index 1269e1b6405c51317ea805291a8aeef57cfc913f..f6a6a8bc7bf56b936eaf112096dca808d9f58773 100644
+--- a/code/cgame/cg_main.c
++++ b/code/cgame/cg_main.c
+@@ -183,6 +183,9 @@ vmCvar_t	cg_noTaunt;
+ vmCvar_t	cg_noProjectileTrail;
+ vmCvar_t	cg_oldRail;
+ vmCvar_t	cg_oldRocket;
++vmCvar_t	cg_destruction;
++vmCvar_t	cg_shake;
++vmCvar_t	cg_rubbleTime;
+ vmCvar_t	cg_oldPlasma;
+ vmCvar_t	cg_trueLightning;
+ 
+@@ -319,6 +322,9 @@ static cvarTable_t cvarTable[] = {
+ 	{ &cg_noProjectileTrail, "cg_noProjectileTrail", "0", CVAR_ARCHIVE},
+ 	{ &cg_oldRail, "cg_oldRail", "1", CVAR_ARCHIVE},
+ 	{ &cg_oldRocket, "cg_oldRocket", "1", CVAR_ARCHIVE},
++	{ &cg_destruction, "cg_destruction", "1", CVAR_ARCHIVE},
++	{ &cg_shake, "cg_shake", "1", CVAR_ARCHIVE},
++	{ &cg_rubbleTime, "cg_rubbleTime", "25", CVAR_ARCHIVE},
+ 	{ &cg_oldPlasma, "cg_oldPlasma", "1", CVAR_ARCHIVE},
+ 	{ &cg_trueLightning, "cg_trueLightning", "0.0", CVAR_ARCHIVE}
+ //	{ &cg_pmove_fixed, "cg_pmove_fixed", "0", CVAR_USERINFO | CVAR_ARCHIVE }
+@@ -1026,6 +1032,25 @@ static void CG_RegisterGraphics( void ) {
+ 	cgs.media.burnMarkShader = trap_R_RegisterShader( "gfx/damage/burn_med_mrk" );
+ 	cgs.media.holeMarkShader = trap_R_RegisterShader( "gfx/damage/hole_lg_mrk" );
+ 	cgs.media.energyMarkShader = trap_R_RegisterShader( "gfx/damage/plasma_mrk" );
++	cgs.media.rocketSparkShader = trap_R_RegisterShader( "gfx/wrecked-quake-iii-arena/spark" );
++	for ( i = 0 ; i < NUM_ROCKET_CHUNKS ; i++ ) {
++		cgs.media.rocketChunkModels[i] = trap_R_RegisterModel( va( "models/wrecked-quake-iii-arena/chunk%i.md3", i + 1 ) );
++	}
++	for ( i = 0 ; i < NUM_ROCKET_GRAVEL ; i++ ) {
++		cgs.media.rocketGravelModels[i] = trap_R_RegisterModel( va( "models/wrecked-quake-iii-arena/gravel%i.md3", i + 1 ) );
++	}
++	for ( i = 0 ; i < NUM_ROCK_SOUNDS ; i++ ) {
++		cgs.media.rockSounds[i] = trap_S_RegisterSound( va( "sound/wrecked-quake-iii-arena/rock%i.wav", i + 1 ), qfalse );
++	}
++	cgs.media.rockBlastSound = trap_S_RegisterSound( "sound/wrecked-quake-iii-arena/blast.wav", qfalse );
++	cgs.media.fireballShader = trap_R_RegisterShader( "gfx/wrecked-quake-iii-arena/fireball" );
++	for ( i = 0 ; i < NUM_SMOKE_SHADERS ; i++ ) {
++		cgs.media.thickSmokeShaders[i] = trap_R_RegisterShader( va( "gfx/wrecked-quake-iii-arena/smoke%i", i + 1 ) );
++	}
++	cgs.media.emberShader = trap_R_RegisterShader( "gfx/wrecked-quake-iii-arena/ember" );
++	cgs.media.shockRingShader = trap_R_RegisterShader( "gfx/wrecked-quake-iii-arena/shockring" );
++	cgs.media.rockSootShader = trap_R_RegisterShader( "gfx/wrecked-quake-iii-arena/soot" );
++	cgs.media.rockCracksShader = trap_R_RegisterShader( "gfx/wrecked-quake-iii-arena/cracks" );
+ 	cgs.media.shadowMarkShader = trap_R_RegisterShader( "markShadow" );
+ 	cgs.media.wakeMarkShader = trap_R_RegisterShader( "wake" );
+ 	cgs.media.bloodMarkShader = trap_R_RegisterShader( "bloodMark" );
+diff --git a/code/cgame/cg_marks.c b/code/cgame/cg_marks.c
+index f219a983f9a1fc9c7f96dbaff75dda169feff802..31a8e0fb9291759335471df8b73ee30bbdfcb7fa 100644
+--- a/code/cgame/cg_marks.c
++++ b/code/cgame/cg_marks.c
+@@ -229,11 +229,12 @@ CG_AddMarks
+ */
+ #define	MARK_TOTAL_TIME		10000
+ #define	MARK_FADE_TIME		1000
++#define	ROCK_MARK_TOTAL_TIME	60000	// soot and cracks around blasted craters
+ 
+ void CG_AddMarks( void ) {
+ 	int			j;
+ 	markPoly_t	*mp, *next;
+-	int			t;
++	int			t, total;
+ 	int			fade;
+ 
+ 	if ( !cg_addMarks.integer ) {
+@@ -246,8 +247,13 @@ void CG_AddMarks( void ) {
+ 		// still have it
+ 		next = mp->nextMark;
+ 
++		total = MARK_TOTAL_TIME;
++		if ( mp->markShader == cgs.media.rockSootShader || mp->markShader == cgs.media.rockCracksShader ) {
++			total = ROCK_MARK_TOTAL_TIME;
++		}
++
+ 		// see if it is time to completely remove it
+-		if ( cg.time > mp->time + MARK_TOTAL_TIME ) {
++		if ( cg.time > mp->time + total ) {
+ 			CG_FreeMarkPoly( mp );
+ 			continue;
+ 		}
+@@ -271,7 +277,7 @@ void CG_AddMarks( void ) {
+ 		}
+ 
+ 		// fade all marks out with time
+-		t = mp->time + MARK_TOTAL_TIME - cg.time;
++		t = mp->time + total - cg.time;
+ 		if ( t < MARK_FADE_TIME ) {
+ 			fade = 255 * t / MARK_FADE_TIME;
+ 			if ( mp->alphaFade ) {
+diff --git a/code/cgame/cg_public.h b/code/cgame/cg_public.h
+index 8cf4ac57843bdb8aea0432371497cd9f0505d3db..6aec83a0c126c5928431326a29075c0dd5faf8ac 100644
+--- a/code/cgame/cg_public.h
++++ b/code/cgame/cg_public.h
+@@ -164,6 +164,7 @@ typedef enum {
+ 	CG_R_INPVS,
+ 	// 1.32
+ 	CG_FS_SEEK,
++	CG_R_WALLMATERIAL,
+ 
+ /*
+ 	CG_LOADCAMERA,
+diff --git a/code/cgame/cg_syscalls.asm b/code/cgame/cg_syscalls.asm
+index 0874b479d99d7eb1f32900798fbf17c236126e9b..6550aa757ee7ff33fa5641b42fe8ad29a95bf3dd 100644
+--- a/code/cgame/cg_syscalls.asm
++++ b/code/cgame/cg_syscalls.asm
+@@ -90,6 +90,7 @@ equ trap_GetEntityToken					-87
+ equ	trap_R_AddPolysToScene				-88
+ equ trap_R_inPVS						-89
+ equ trap_FS_Seek			-90
++equ trap_R_WallMaterial		-91
+ 
+ equ	memset						-101
+ equ	memcpy						-102
+diff --git a/code/cgame/cg_syscalls.c b/code/cgame/cg_syscalls.c
+index 010be948c67c4ca8402d0c38393bf8ac8ac5cf91..dc7aab6bd227094960be4157aa8714657497a8b6 100644
+--- a/code/cgame/cg_syscalls.c
++++ b/code/cgame/cg_syscalls.c
+@@ -105,6 +105,10 @@ int trap_FS_Seek( fileHandle_t f, long offset, int origin ) {
+ 	return syscall( CG_FS_SEEK, f, offset, origin );
+ }
+ 
++qhandle_t trap_R_WallMaterial( const vec3_t origin, const vec3_t dir ) {
++	return syscall( CG_R_WALLMATERIAL, origin, dir );
++}
++
+ void	trap_SendConsoleCommand( const char *text ) {
+ 	syscall( CG_SENDCONSOLECOMMAND, text );
+ }
+diff --git a/code/cgame/cg_view.c b/code/cgame/cg_view.c
+index 3dba5ebae28f25a19c66a0bc02df782f47e2df40..08c21522e4f387ada95f618547c7c132d5f55fc7 100644
+--- a/code/cgame/cg_view.c
++++ b/code/cgame/cg_view.c
+@@ -603,6 +603,57 @@ static void CG_DamageBlendBlob( void ) {
+ }
+ 
+ 
++/*
++===============
++CG_ShakeView
++
++A blast at origin jolts the view, harder the closer it is. Shakes do not add up: a second blast only makes it as hard again as it would be on its own.
++===============
++*/
++void CG_ShakeView( const vec3_t origin, float amount ) {
++	float	d, left;
++	int		i;
++
++	d = Distance( origin, cg.predictedPlayerState.origin );
++	if ( d >= 700 ) {
++		return;
++	}
++	amount *= ( 1 - d / 700 ) * ( 1 - d / 700 ) * cg_shake.value;
++
++	left = cg.time - cg.shakeTime < SHAKE_TIME ? cg.shakeAmount * ( 1 - (float)( cg.time - cg.shakeTime ) / SHAKE_TIME ) : 0;
++	if ( amount <= left ) {
++		return;
++	}
++	cg.shakeTime = cg.time;
++	cg.shakeAmount = amount;
++	for ( i = 0 ; i < 3 ; i++ ) {
++		cg.shakePhase[i] = random() * 2 * M_PI;
++	}
++}
++
++/*
++===============
++CG_AddShake
++
++Jolts the view angles, not where the player aims: a quick, uneven shudder that dies away
++===============
++*/
++static void CG_AddShake( void ) {
++	float	t, k;
++	int		i;
++
++	t = cg.time - cg.shakeTime;
++	if ( t < 0 || t >= SHAKE_TIME || cg.shakeAmount <= 0 ) {
++		return;
++	}
++	k = 1 - t / SHAKE_TIME;
++	k = cg.shakeAmount * k * k;
++	for ( i = 0 ; i < 3 ; i++ ) {
++		cg.refdefViewAngles[i] += k * ( i == ROLL ? 0.75f : ( i == PITCH ? 1.5f : 1.0f ) )
++			* ( 0.65f * sin( t * 0.075f + cg.shakePhase[i] ) + 0.35f * sin( t * 0.131f + cg.shakePhase[( i + 1 ) % 3] * 2 ) );
++	}
++}
++
+ /*
+ ===============
+ CG_CalcViewValues
+@@ -682,6 +733,8 @@ static int CG_CalcViewValues( void ) {
+ 		CG_OffsetFirstPersonView();
+ 	}
+ 
++	CG_AddShake();
++
+ 	// position eye relative to origin
+ 	AnglesToAxis( cg.refdefViewAngles, cg.refdef.viewaxis );
+ 
+diff --git a/code/cgame/cg_weapons.c b/code/cgame/cg_weapons.c
+index e4cead4b34670632a060b56b90a9ad8285e4a8d2..ccddeb04369fce0f81889f879d444b0bbaf4eafc 100644
+--- a/code/cgame/cg_weapons.c
++++ b/code/cgame/cg_weapons.c
+@@ -1934,6 +1934,15 @@ void CG_MissileHitWall( int weapon, int clientNum, vec3_t origin, vec3_t dir, im
+ 	} else {
+ 		CG_ImpactMark( mark, origin, dir, random()*360, 1,1,1,1, alphaFade, radius, qfalse );
+ 	}
++
++	if ( weapon == WP_ROCKET_LAUNCHER && cg_destruction.integer ) {
++		CG_RocketFireball( origin, dir, soundType != IMPACTSOUND_FLESH );
++		if ( soundType != IMPACTSOUND_FLESH ) {
++			CG_RocketWallDamage( origin, dir );
++		}
++	} else if ( cg_destruction.integer && soundType != IMPACTSOUND_FLESH ) {
++		CG_ShotWallDamage( weapon, origin, dir );
++	}
+ }
+ 
+ 

@@ -1,0 +1,1087 @@
+diff --git a/code/renderercommon/qgl.h b/code/renderercommon/qgl.h
+index 512cdefcb01071f47726864c53d0a2f50140f305..5a9ef616b791f62c6976872b521f5bf9f4a003e6 100644
+--- a/code/renderercommon/qgl.h
++++ b/code/renderercommon/qgl.h
+@@ -185,6 +185,7 @@ extern void (APIENTRYP qglUnlockArraysEXT) (void);
+ 	GLE(void, Uniform4f, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) \
+ 	GLE(void, Uniform1i, GLint location, GLint v0) \
+ 	GLE(void, Uniform1fv, GLint location, GLsizei count, const GLfloat *value) \
++	GLE(void, Uniform4fv, GLint location, GLsizei count, const GLfloat *value) \
+ 	GLE(void, UniformMatrix4fv, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) \
+ 	GLE(void, ValidateProgram, GLuint program) \
+ 	GLE(void, VertexAttribPointer, GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer) \
+@@ -240,6 +241,8 @@ extern void (APIENTRYP qglUnlockArraysEXT) (void);
+ // OpenGL 3.0 specific
+ #define QGL_3_0_PROCS \
+ 	GLE(const GLubyte *, GetStringi, GLenum name, GLuint index) \
++	GLE(void *, MapBufferRange, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) \
++	GLE(GLboolean, UnmapBuffer, GLenum target) \
+ 
+ // GL_ARB_framebuffer_object, built-in to OpenGL 3.0
+ #define QGL_ARB_framebuffer_object_PROCS \
+diff --git a/code/renderercommon/tr_public.h b/code/renderercommon/tr_public.h
+index 21739f99644a8c4095eee049aeb02cf8f35318c0..487d071bebf210ec32ed072b895d60f38387c57b 100644
+--- a/code/renderercommon/tr_public.h
++++ b/code/renderercommon/tr_public.h
+@@ -24,7 +24,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ 
+ #include "tr_types.h"
+ 
+-#define	REF_API_VERSION		8
++#define	REF_API_VERSION		9
+ 
+ //
+ // these are the functions exported by the refresh module
+@@ -99,6 +99,13 @@ typedef struct {
+ 	qboolean (*inPVS)( const vec3_t p1, const vec3_t p2 );
+ 
+ 	void (*TakeVideoFrame)( int h, int w, byte* captureBuffer, byte *encodeBuffer, qboolean motionJpeg );
++
++	// world surfaces are not drawn inside blasted walls. each hole is 8 floats: origin, deepest cut, normal, and its tile in the depth mask; see worldHole_t for how the grid lies on the wall
++	void	(*SetWorldHoles)( int numHoles, const float *holes );
++	// carved depth in units (see WORLD_HOLE_BIAS) for each point of a hole's grid, row by row from the bottom
++	void	(*SetWorldHoleMask)( int tile, const byte *depths );
++	// a plain shader with the texture of a world surface's shader, coloured by vertex, two sided and tiling every 128 units at the usual texture scale; 0 if it has no texture. For models it is lit like one instead, and tiles every 24 units of their texture coordinates.
++	qhandle_t (*RegisterMaterialShader)( const char *name, qboolean forModels );
+ } refexport_t;
+ 
+ //
+diff --git a/code/renderergl2/glsl/dlight_fp.glsl b/code/renderergl2/glsl/dlight_fp.glsl
+index 41be0494fcc907913238d3d84c5e92232fe9402a..0ab61f1ebdd032bab5c946c88499d6c5d4b16efb 100644
+--- a/code/renderergl2/glsl/dlight_fp.glsl
++++ b/code/renderergl2/glsl/dlight_fp.glsl
+@@ -6,8 +6,48 @@ varying vec2      var_Tex1;
+ varying vec4      var_Color;
+ 
+ 
++uniform int  u_NumWorldHoles;
++uniform vec4 u_WorldHoles[256];
++uniform sampler2D u_HoleMask;
++varying vec3 var_HolePos;
++
++// world holes: skip anything inside a crater blasted into a wall. each hole is a 64x64 grid of points 8 units apart on the wall, with the carved depth of each point (plus 64, see WORLD_HOLE_BIAS) in its mask tile, interpolated over two triangles per cell
++void CutWorldHoles()
++{
++	for (int i = 0; i < u_NumWorldHoles; i++)
++	{
++		vec4 center = u_WorldHoles[i * 2];
++		vec4 axis   = u_WorldHoles[i * 2 + 1];
++		vec3 delta  = var_HolePos - center.xyz;
++		float h     = dot(delta, axis.xyz);
++
++		if (h > 1.0 || h < -center.w)
++			continue;
++
++		// floors run along x and y, walls along the wall and up
++		vec2 g = (abs(axis.z) > 0.5 ? delta.xy : vec2(dot(delta.xy, vec2(-axis.y, axis.x)), delta.z)) / 8.0 + 32.0;
++		if (g.x < 0.0 || g.y < 0.0 || g.x >= 63.0 || g.y >= 63.0)
++			continue;
++
++		vec2 cell = floor(g);
++		vec2 f = g - cell;
++		vec2 tc = (vec2(mod(axis.w, 16.0), floor(axis.w / 16.0)) * 64.0 + cell + 0.5) / 1024.0;
++		float d00 = texture2D(u_HoleMask, tc).r;
++		float d10 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0, 0.0)).r;
++		float d01 = texture2D(u_HoleMask, tc + vec2(0.0, 1.0 / 1024.0)).r;
++		float d11 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0)).r;
++		float depth = 255.0 * (f.x >= f.y ? d00 + f.x * (d10 - d00) + f.y * (d11 - d10)
++		                                  : d00 + f.y * (d01 - d00) + f.x * (d11 - d01)) - 64.0;
++
++		if (depth > 2.0 && h > -depth)
++			discard;
++	}
++}
++
+ void main()
+ {
++	CutWorldHoles();
++
+ 	vec4 color = texture2D(u_DiffuseMap, var_Tex1);
+ 
+ 	float alpha = color.a * var_Color.a;
+diff --git a/code/renderergl2/glsl/dlight_vp.glsl b/code/renderergl2/glsl/dlight_vp.glsl
+index c326bd7894b754467683323c4af546a102122e1f..186cd20ec5bc7aa5e0bf395f52b2c8b010ca3e0a 100644
+--- a/code/renderergl2/glsl/dlight_vp.glsl
++++ b/code/renderergl2/glsl/dlight_vp.glsl
+@@ -71,6 +71,8 @@ vec3 DeformPosition(const vec3 pos, const vec3 normal, const vec2 st)
+ }
+ #endif
+ 
++varying vec3 var_HolePos;
++
+ void main()
+ {
+ 	vec3 position = attr_Position;
+@@ -80,6 +82,7 @@ void main()
+ 	position = DeformPosition(position, normal, attr_TexCoord0.st);
+ #endif
+ 
++	var_HolePos = position;
+ 	gl_Position = u_ModelViewProjectionMatrix * vec4(position, 1.0);
+ 		
+ 	vec3 dist = u_DlightInfo.xyz - position;
+diff --git a/code/renderergl2/glsl/fogpass_fp.glsl b/code/renderergl2/glsl/fogpass_fp.glsl
+index e2ad465ba39175fd48bad3adbb051fab324333dc..3f976136d6317b2b58acb12bf0ec75f7e1b8e18e 100644
+--- a/code/renderergl2/glsl/fogpass_fp.glsl
++++ b/code/renderergl2/glsl/fogpass_fp.glsl
+@@ -2,8 +2,48 @@ uniform vec4  u_Color;
+ 
+ varying float var_Scale;
+ 
++uniform int  u_NumWorldHoles;
++uniform vec4 u_WorldHoles[256];
++uniform sampler2D u_HoleMask;
++varying vec3 var_HolePos;
++
++// world holes: skip anything inside a crater blasted into a wall. each hole is a 64x64 grid of points 8 units apart on the wall, with the carved depth of each point (plus 64, see WORLD_HOLE_BIAS) in its mask tile, interpolated over two triangles per cell
++void CutWorldHoles()
++{
++	for (int i = 0; i < u_NumWorldHoles; i++)
++	{
++		vec4 center = u_WorldHoles[i * 2];
++		vec4 axis   = u_WorldHoles[i * 2 + 1];
++		vec3 delta  = var_HolePos - center.xyz;
++		float h     = dot(delta, axis.xyz);
++
++		if (h > 1.0 || h < -center.w)
++			continue;
++
++		// floors run along x and y, walls along the wall and up
++		vec2 g = (abs(axis.z) > 0.5 ? delta.xy : vec2(dot(delta.xy, vec2(-axis.y, axis.x)), delta.z)) / 8.0 + 32.0;
++		if (g.x < 0.0 || g.y < 0.0 || g.x >= 63.0 || g.y >= 63.0)
++			continue;
++
++		vec2 cell = floor(g);
++		vec2 f = g - cell;
++		vec2 tc = (vec2(mod(axis.w, 16.0), floor(axis.w / 16.0)) * 64.0 + cell + 0.5) / 1024.0;
++		float d00 = texture2D(u_HoleMask, tc).r;
++		float d10 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0, 0.0)).r;
++		float d01 = texture2D(u_HoleMask, tc + vec2(0.0, 1.0 / 1024.0)).r;
++		float d11 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0)).r;
++		float depth = 255.0 * (f.x >= f.y ? d00 + f.x * (d10 - d00) + f.y * (d11 - d10)
++		                                  : d00 + f.y * (d01 - d00) + f.x * (d11 - d01)) - 64.0;
++
++		if (depth > 2.0 && h > -depth)
++			discard;
++	}
++}
++
+ void main()
+ {
++	CutWorldHoles();
++
+ 	gl_FragColor = u_Color;
+ 	gl_FragColor.a = sqrt(clamp(var_Scale, 0.0, 1.0));
+ }
+diff --git a/code/renderergl2/glsl/fogpass_vp.glsl b/code/renderergl2/glsl/fogpass_vp.glsl
+index 72ea0af68082b547e1962531fe8cc40b585dcf22..e980a15fcc752ad1e9192a616f5142d9ae9b635d 100644
+--- a/code/renderergl2/glsl/fogpass_vp.glsl
++++ b/code/renderergl2/glsl/fogpass_vp.glsl
+@@ -102,6 +102,8 @@ float CalcFog(vec3 position)
+ 	return s * t;
+ }
+ 
++varying vec3 var_HolePos;
++
+ void main()
+ {
+ #if defined(USE_VERTEX_ANIMATION)
+@@ -125,6 +127,7 @@ void main()
+ 	position.xyz = DeformPosition(position.xyz, normal, attr_TexCoord0.st);
+ #endif
+ 
++	var_HolePos = position;
+ 	gl_Position = u_ModelViewProjectionMatrix * vec4(position, 1.0);
+ 
+ 	var_Scale = CalcFog(position) * u_Color.a * u_Color.a;
+diff --git a/code/renderergl2/glsl/generic_fp.glsl b/code/renderergl2/glsl/generic_fp.glsl
+index c0a49407c7fa3752c19003c98b03b5b4df9d513d..0ffdb22b23f46f62ff6f6af61a53fc0df4e5ba0b 100644
+--- a/code/renderergl2/glsl/generic_fp.glsl
++++ b/code/renderergl2/glsl/generic_fp.glsl
+@@ -7,8 +7,48 @@ varying vec2      var_DiffuseTex;
+ varying vec4      var_Color;
+ 
+ 
++uniform int  u_NumWorldHoles;
++uniform vec4 u_WorldHoles[256];
++uniform sampler2D u_HoleMask;
++varying vec3 var_HolePos;
++
++// world holes: skip anything inside a crater blasted into a wall. each hole is a 64x64 grid of points 8 units apart on the wall, with the carved depth of each point (plus 64, see WORLD_HOLE_BIAS) in its mask tile, interpolated over two triangles per cell
++void CutWorldHoles()
++{
++	for (int i = 0; i < u_NumWorldHoles; i++)
++	{
++		vec4 center = u_WorldHoles[i * 2];
++		vec4 axis   = u_WorldHoles[i * 2 + 1];
++		vec3 delta  = var_HolePos - center.xyz;
++		float h     = dot(delta, axis.xyz);
++
++		if (h > 1.0 || h < -center.w)
++			continue;
++
++		// floors run along x and y, walls along the wall and up
++		vec2 g = (abs(axis.z) > 0.5 ? delta.xy : vec2(dot(delta.xy, vec2(-axis.y, axis.x)), delta.z)) / 8.0 + 32.0;
++		if (g.x < 0.0 || g.y < 0.0 || g.x >= 63.0 || g.y >= 63.0)
++			continue;
++
++		vec2 cell = floor(g);
++		vec2 f = g - cell;
++		vec2 tc = (vec2(mod(axis.w, 16.0), floor(axis.w / 16.0)) * 64.0 + cell + 0.5) / 1024.0;
++		float d00 = texture2D(u_HoleMask, tc).r;
++		float d10 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0, 0.0)).r;
++		float d01 = texture2D(u_HoleMask, tc + vec2(0.0, 1.0 / 1024.0)).r;
++		float d11 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0)).r;
++		float depth = 255.0 * (f.x >= f.y ? d00 + f.x * (d10 - d00) + f.y * (d11 - d10)
++		                                  : d00 + f.y * (d01 - d00) + f.x * (d11 - d01)) - 64.0;
++
++		if (depth > 2.0 && h > -depth)
++			discard;
++	}
++}
++
+ void main()
+ {
++	CutWorldHoles();
++
+ 	vec4 color  = texture2D(u_DiffuseMap, var_DiffuseTex);
+ 
+ 	float alpha = color.a * var_Color.a;
+diff --git a/code/renderergl2/glsl/generic_vp.glsl b/code/renderergl2/glsl/generic_vp.glsl
+index e6af9f8134ea54c23df3164e640a0c9c6d9bdee2..c04f54d84ceb110fc93bcbaded9747b97d2b3c09 100644
+--- a/code/renderergl2/glsl/generic_vp.glsl
++++ b/code/renderergl2/glsl/generic_vp.glsl
+@@ -221,6 +221,8 @@ float CalcFog(vec3 position)
+ }
+ #endif
+ 
++varying vec3 var_HolePos;
++
+ void main()
+ {
+ #if defined(USE_VERTEX_ANIMATION)
+@@ -244,6 +246,7 @@ void main()
+ 	position = DeformPosition(position, normal, attr_TexCoord0.st);
+ #endif
+ 
++	var_HolePos = position;
+ 	gl_Position = u_ModelViewProjectionMatrix * vec4(position, 1.0);
+ 
+ #if defined(USE_TCGEN)
+diff --git a/code/renderergl2/glsl/lightall_fp.glsl b/code/renderergl2/glsl/lightall_fp.glsl
+index 28b59eb7d3b63574be541a815f83c262280703ec..8438435ed0010bb1f1df954b363f3e662e476482 100644
+--- a/code/renderergl2/glsl/lightall_fp.glsl
++++ b/code/renderergl2/glsl/lightall_fp.glsl
+@@ -257,8 +257,48 @@ vec4 hitCube(vec3 ray, vec3 pos, vec3 invSize, float lod, samplerCube tex)
+ }
+ #endif
+ 
++uniform int  u_NumWorldHoles;
++uniform vec4 u_WorldHoles[256];
++uniform sampler2D u_HoleMask;
++varying vec3 var_HolePos;
++
++// world holes: skip anything inside a crater blasted into a wall. each hole is a 64x64 grid of points 8 units apart on the wall, with the carved depth of each point (plus 64, see WORLD_HOLE_BIAS) in its mask tile, interpolated over two triangles per cell
++void CutWorldHoles()
++{
++	for (int i = 0; i < u_NumWorldHoles; i++)
++	{
++		vec4 center = u_WorldHoles[i * 2];
++		vec4 axis   = u_WorldHoles[i * 2 + 1];
++		vec3 delta  = var_HolePos - center.xyz;
++		float h     = dot(delta, axis.xyz);
++
++		if (h > 1.0 || h < -center.w)
++			continue;
++
++		// floors run along x and y, walls along the wall and up
++		vec2 g = (abs(axis.z) > 0.5 ? delta.xy : vec2(dot(delta.xy, vec2(-axis.y, axis.x)), delta.z)) / 8.0 + 32.0;
++		if (g.x < 0.0 || g.y < 0.0 || g.x >= 63.0 || g.y >= 63.0)
++			continue;
++
++		vec2 cell = floor(g);
++		vec2 f = g - cell;
++		vec2 tc = (vec2(mod(axis.w, 16.0), floor(axis.w / 16.0)) * 64.0 + cell + 0.5) / 1024.0;
++		float d00 = texture2D(u_HoleMask, tc).r;
++		float d10 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0, 0.0)).r;
++		float d01 = texture2D(u_HoleMask, tc + vec2(0.0, 1.0 / 1024.0)).r;
++		float d11 = texture2D(u_HoleMask, tc + vec2(1.0 / 1024.0)).r;
++		float depth = 255.0 * (f.x >= f.y ? d00 + f.x * (d10 - d00) + f.y * (d11 - d10)
++		                                  : d00 + f.y * (d01 - d00) + f.x * (d11 - d01)) - 64.0;
++
++		if (depth > 2.0 && h > -depth)
++			discard;
++	}
++}
++
+ void main()
+ {
++	CutWorldHoles();
++
+ 	vec3 viewDir, lightColor, ambientColor, reflectance;
+ 	vec3 L, N, E, H;
+ 	float NL, NH, NE, EH, attenuation;
+diff --git a/code/renderergl2/glsl/lightall_vp.glsl b/code/renderergl2/glsl/lightall_vp.glsl
+index 8ff5e7bbfb3e4dd9f48bc14f3439ffb042d8fe4f..2e2fef4bf35b9ebdfbeaaf3aa6c734ae9070114f 100644
+--- a/code/renderergl2/glsl/lightall_vp.glsl
++++ b/code/renderergl2/glsl/lightall_vp.glsl
+@@ -163,6 +163,8 @@ float CalcLightAttenuation(float point, float normDist)
+ }
+ 
+ 
++varying vec3 var_HolePos;
++
+ void main()
+ {
+ #if defined(USE_VERTEX_ANIMATION)
+@@ -212,6 +214,7 @@ void main()
+ 	var_TexCoords.xy = texCoords;
+ #endif
+ 
++	var_HolePos = position;
+ 	gl_Position = u_ModelViewProjectionMatrix * vec4(position, 1.0);
+ 
+ #if defined(USE_MODELMATRIX)
+diff --git a/code/renderergl2/tr_bsp.c b/code/renderergl2/tr_bsp.c
+index 9c68d02c7ea59613fa456f964552d0cc9e94b224..69094c293668ccf025da68a3d75598bc811c6e04 100644
+--- a/code/renderergl2/tr_bsp.c
++++ b/code/renderergl2/tr_bsp.c
+@@ -734,6 +734,10 @@ static void ParseFace( dsurface_t *ds, drawVert_t *verts, float *hdrVertColors,
+ 	for(i = 0; i < numVerts; i++)
+ 		LoadDrawVertToSrfVert(&cv->verts[i], &verts[i], realLightmapNum, hdrVertColors ? hdrVertColors + (ds->firstVert + i) * 3 : NULL, surf->cullinfo.bounds);
+ 
++	// the backend cuts holes only into the surfaces this box reaches
++	VectorCopy(surf->cullinfo.bounds[0], cv->cullBounds[0]);
++	VectorCopy(surf->cullinfo.bounds[1], cv->cullBounds[1]);
++
+ 	// copy triangles
+ 	badTriangles = 0;
+ 	indexes += LittleLong(ds->firstIndex);
+@@ -897,6 +901,10 @@ static void ParseTriSurf( dsurface_t *ds, drawVert_t *verts, float *hdrVertColor
+ 	for(i = 0; i < numVerts; i++)
+ 		LoadDrawVertToSrfVert(&cv->verts[i], &verts[i], -1, hdrVertColors ? hdrVertColors + (ds->firstVert + i) * 3 : NULL, surf->cullinfo.bounds);
+ 
++	// the backend cuts holes only into the surfaces this box reaches
++	VectorCopy(surf->cullinfo.bounds[0], cv->cullBounds[0]);
++	VectorCopy(surf->cullinfo.bounds[1], cv->cullBounds[1]);
++
+ 	// copy triangles
+ 	badTriangles = 0;
+ 	indexes += LittleLong(ds->firstIndex);
+@@ -2712,6 +2720,9 @@ void RE_LoadWorldMap( const char *name ) {
+ 		ri.Error( ERR_DROP, "ERROR: attempted to redundantly load world map" );
+ 	}
+ 
++	tr.numWorldHoles = 0;
++	tr.worldHolesGeneration++;
++
+ 	// set default map light scale
+ 	tr.sunShadowScale = 0.5f;
+ 
+diff --git a/code/renderergl2/tr_dsa.c b/code/renderergl2/tr_dsa.c
+index e43df0bbec92721ff064fe06fda4ae9e660c24f2..805bbf2820f3092f41a94cf6ce4bd79c3b5623e7 100644
+--- a/code/renderergl2/tr_dsa.c
++++ b/code/renderergl2/tr_dsa.c
+@@ -24,7 +24,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ 
+ static struct
+ {
+-	GLuint textures[NUM_TEXTURE_BUNDLES];
++	GLuint textures[NUM_TEXTURE_BUNDLES + 1];	// + TB_HOLEMASK
+ 	GLenum texunit;
+ 
+ 	GLuint program;
+diff --git a/code/renderergl2/tr_glsl.c b/code/renderergl2/tr_glsl.c
+index 27271f0e7efaeabc02c4000846d48f395bd220f6..41cb04d37fc2e46bd9fb7499d7e6047c0ca9a346 100644
+--- a/code/renderergl2/tr_glsl.c
++++ b/code/renderergl2/tr_glsl.c
+@@ -679,6 +679,13 @@ void GLSL_InitUniforms(shaderProgram_t *program)
+ 
+ 	GLint *uniforms = program->uniforms;
+ 
++	program->holeUniforms[0] = qglGetUniformLocation(program->program, "u_NumWorldHoles");
++	program->holeUniforms[1] = qglGetUniformLocation(program->program, "u_WorldHoles");
++	program->holeUniforms[2] = qglGetUniformLocation(program->program, "u_HoleMask");
++	program->holeCount = 0;
++	program->holeGeneration = -1;
++	program->holeMaskSet = qfalse;
++
+ 	size = 0;
+ 	for (i = 0; i < UNIFORM_COUNT; i++)
+ 	{
+@@ -1597,6 +1604,8 @@ void GLSL_ShutdownGPUShaders(void)
+ }
+ 
+ 
++static void GLSL_SetWorldHoles(shaderProgram_t *program);
++
+ void GLSL_BindProgram(shaderProgram_t * program)
+ {
+ 	GLuint programObject = program ? program->program : 0;
+@@ -1610,6 +1619,66 @@ void GLSL_BindProgram(shaderProgram_t * program)
+ 
+ 	if (GL_UseProgram(programObject))
+ 		backEnd.pc.c_glslShaderBinds++;
++
++	if (program && program->holeUniforms[0] != -1)
++		GLSL_SetWorldHoles(program);
++}
++
++
++// only world geometry is cut, entities keep their model space positions. Every hole costs each pixel drawn, so world surfaces only get the holes that reach them; other world batches, like crater linings and marks, get all of them. The sky box, clouds and sun are drawn around the view rather than in the world, so they are never cut.
++static void GLSL_SetWorldHoles(shaderProgram_t *program)
++{
++	static vec4_t holes[MAX_RENDER_HOLES * 2];
++	int bits[MAX_RENDER_HOLES / 32];
++	int count = 0, i;
++
++	Com_Memset(bits, 0, sizeof(bits));
++
++	if (backEnd.currentEntity == &tr.worldEntity && !(backEnd.refdef.rdflags & RDF_NOWORLDMODEL) && tr.worldHoleMaskImage
++		&& tess.shader && !tess.shader->isSky && tess.shader != tr.sunShader && tess.shader != tr.sunFlareShader)
++	{
++		for (i = 0; i < tr.numWorldHoles; i++)
++		{
++			if (tess.holeBoundsSet && (!tr.worldHoleCarved[i]
++				|| !BoundsIntersect(tess.holeBounds[0], tess.holeBounds[1], tr.worldHoleBounds[i][0], tr.worldHoleBounds[i][1])))
++				continue;
++
++			bits[i >> 5] |= 1 << (i & 31);
++			count++;
++		}
++	}
++
++	if (count)
++		GL_BindToTMU(tr.worldHoleMaskImage, TB_HOLEMASK);
++
++	if (count && !program->holeMaskSet && program->holeUniforms[2] != -1)
++	{
++		qglUniform1i(program->holeUniforms[2], TB_HOLEMASK);
++		program->holeMaskSet = qtrue;
++	}
++
++	if (count == program->holeCount && (!count || (program->holeGeneration == tr.worldHolesGeneration && !memcmp(bits, program->holeBits, sizeof(bits)))))
++		return;
++
++	program->holeCount = count;
++	program->holeGeneration = tr.worldHolesGeneration;
++	Com_Memcpy(program->holeBits, bits, sizeof(bits));
++
++	qglUniform1i(program->holeUniforms[0], count);
++	if (count && program->holeUniforms[1] != -1)
++	{
++		count = 0;
++		for (i = 0; i < tr.numWorldHoles; i++)
++		{
++			if (bits[i >> 5] & (1 << (i & 31)))
++			{
++				Vector4Copy(tr.worldHoles[i * 2], holes[count * 2]);
++				Vector4Copy(tr.worldHoles[i * 2 + 1], holes[count * 2 + 1]);
++				count++;
++			}
++		}
++		qglUniform4fv(program->holeUniforms[1], count * 2, holes[0]);
++	}
+ }
+ 
+ 
+diff --git a/code/renderergl2/tr_init.c b/code/renderergl2/tr_init.c
+index 5389d09fd5fee316ae300cb3e586d21d85b160f6..cf009e5e0f7ea43ec17d00579293369e0fc0fc9b 100644
+--- a/code/renderergl2/tr_init.c
++++ b/code/renderergl2/tr_init.c
+@@ -1711,6 +1711,9 @@ refexport_t *GetRefAPI ( int apiVersion, refimport_t *rimp ) {
+ 	re.inPVS = R_inPVS;
+ 
+ 	re.TakeVideoFrame = RE_TakeVideoFrame;
++	re.SetWorldHoles = RE_SetWorldHoles;
++	re.SetWorldHoleMask = RE_SetWorldHoleMask;
++	re.RegisterMaterialShader = RE_RegisterMaterialShader;
+ 
+ 	return &re;
+ }
+diff --git a/code/renderergl2/tr_local.h b/code/renderergl2/tr_local.h
+index d6349038ef51dd979b4002b4b4d437498835b7f2..4b89da9458290397937c77221db60acf6ed952ee 100644
+--- a/code/renderergl2/tr_local.h
++++ b/code/renderergl2/tr_local.h
+@@ -376,6 +376,9 @@ enum
+ 	NUM_TEXTURE_BUNDLES = 7
+ };
+ 
++// carved depths of world holes, outside the shader bundles
++#define TB_HOLEMASK		NUM_TEXTURE_BUNDLES
++
+ typedef enum
+ {
+ 	// material shader stage types
+@@ -715,6 +718,8 @@ typedef enum
+ 
+ // shaderProgram_t represents a pair of one
+ // GLSL vertex and one GLSL fragment shader
++#define MAX_RENDER_HOLES	128
++
+ typedef struct shaderProgram_s
+ {
+ 	char            name[MAX_QPATH];
+@@ -728,6 +733,12 @@ typedef struct shaderProgram_s
+ 	GLint uniforms[UNIFORM_COUNT];
+ 	short uniformBufferOffsets[UNIFORM_COUNT]; // max 32767/64=511 uniforms
+ 	char  *uniformBuffer;
++
++	GLint holeUniforms[3];		// u_NumWorldHoles, u_WorldHoles, u_HoleMask
++	int   holeCount;
++	int   holeGeneration;
++	int   holeBits[MAX_RENDER_HOLES / 32];	// which holes the uniforms hold
++	qboolean holeMaskSet;
+ } shaderProgram_t;
+ 
+ // trRefdef_t holds everything that comes in refdef_t,
+@@ -1514,6 +1525,14 @@ typedef struct {
+ 	int						visClusters[MAX_VISCOUNTS];
+ 	int						visCounts[MAX_VISCOUNTS];	// incremented every time a new vis cluster is entered
+ 
++	int						numWorldHoles;
++	vec4_t					worldHoles[MAX_RENDER_HOLES * 2];
++	int						worldHolesGeneration;
++	image_t					*worldHoleMaskImage;
++	int						worldHoleExtents[MAX_RENDER_HOLES][4];	// carved grid points: min x, min y, max x, max y
++	vec3_t					worldHoleBounds[MAX_RENDER_HOLES][2];	// world space box around the carved part
++	qboolean				worldHoleCarved[MAX_RENDER_HOLES];
++
+ 	int						frameCount;		// incremented every frame
+ 	int						sceneCount;		// incremented every scene
+ 	int						viewCount;		// incremented every view (twice a scene if portaled)
+@@ -2077,6 +2096,10 @@ typedef struct shaderCommands_s
+ 	int			dlightBits;	// or together of all vertexDlightBits
+ 	int         pshadowBits;
+ 
++	// box around the world surfaces in this batch, so only the holes that reach them are cut; batches of anything else get every hole
++	qboolean	holeBoundsSet;
++	vec3_t		holeBounds[2];
++
+ 	int			firstIndex;
+ 	int			numIndexes;
+ 	int			numVertexes;
+@@ -2232,6 +2255,7 @@ void            R_ShutdownVaos(void);
+ void            R_VaoList_f(void);
+ 
+ void            RB_UpdateTessVao(unsigned int attribBits);
++extern int      tessIndexBase;
+ 
+ void VaoCache_Commit(void);
+ void VaoCache_DrawElements(int numIndexes, int firstIndex);
+@@ -2284,6 +2308,9 @@ void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, fl
+ void RE_AddAdditiveLightToScene( const vec3_t org, float intensity, float r, float g, float b );
+ void RE_BeginScene( const refdef_t *fd );
+ void RE_RenderScene( const refdef_t *fd );
++void RE_SetWorldHoles( int numHoles, const float *holes );
++void RE_SetWorldHoleMask( int tile, const byte *depths );
++qhandle_t RE_RegisterMaterialShader( const char *name, qboolean forModels );
+ void RE_EndScene( void );
+ 
+ /*
+@@ -2482,8 +2509,8 @@ typedef enum {
+ // these are sort of arbitrary limits.
+ // the limits apply to the sum of all scenes in a frame --
+ // the main view, all the 3D icons, etc
+-#define	MAX_POLYS		600
+-#define	MAX_POLYVERTS	3000
++#define	MAX_POLYS		32768
++#define	MAX_POLYVERTS	131072
+ 
+ // all of the information needed by the back end must be
+ // contained in a backEndData_t
+diff --git a/code/renderergl2/tr_scene.c b/code/renderergl2/tr_scene.c
+index aea153e19e078b2920e99c45408882b6a7d3adc6..7cc05d44413e78832de7f2e60ffeaf0937ef2337 100644
+--- a/code/renderergl2/tr_scene.c
++++ b/code/renderergl2/tr_scene.c
+@@ -571,3 +571,137 @@ void RE_RenderScene( const refdef_t *fd ) {
+ 
+ 	tr.frontEndMsec += ri.Milliseconds() - startTime;
+ }
++
++
++/*
++@@@@@@@@@@@@@@@@@@@@@
++RE_SetWorldHoles
++
++The client passes the current world holes before each scene.
++@@@@@@@@@@@@@@@@@@@@@
++*/
++void R_SetWorldHoleBounds( void );
++
++void RE_SetWorldHoles( int numHoles, const float *holes ) {
++	if ( numHoles < 0 ) {
++		numHoles = 0;
++	}
++	if ( numHoles > MAX_RENDER_HOLES ) {
++		numHoles = MAX_RENDER_HOLES;
++	}
++
++	if ( numHoles == tr.numWorldHoles && !memcmp( tr.worldHoles, holes, numHoles * sizeof( vec4_t ) * 2 ) ) {
++		return;
++	}
++
++	tr.numWorldHoles = numHoles;
++	Com_Memcpy( tr.worldHoles, holes, numHoles * sizeof( vec4_t ) * 2 );
++	tr.worldHolesGeneration++;
++	R_SetWorldHoleBounds();
++}
++
++
++#define	HOLE_MASK_GRID		64		// points per hole side, WORLD_HOLE_GRID
++#define	HOLE_MASK_TILES		16		// tiles per mask side
++#define	HOLE_MASK_SIZE		( HOLE_MASK_GRID * HOLE_MASK_TILES )
++#define	HOLE_MASK_CELL		8		// units between points, WORLD_HOLE_CELL
++#define	HOLE_MASK_BIAS		64		// added to carved depths, WORLD_HOLE_BIAS
++#define	HOLE_MASK_CARVED	2		// shallower than this the shaders leave the wall alone
++
++/*
++=============
++R_SetWorldHoleBounds
++
++Puts a box around the carved part of every hole, from the extents of its mask and how deep it goes, so batches of world surfaces away from it skip it
++=============
++*/
++void R_SetWorldHoleBounds( void ) {
++	int		i, k;
++	float	*center, *axis, a, b, h;
++	vec3_t	u, v, p;
++	const int	*ext;
++
++	for ( i = 0 ; i < tr.numWorldHoles ; i++ ) {
++		ext = tr.worldHoleExtents[i];
++		tr.worldHoleCarved[i] = ext[0] <= ext[2];
++		if ( !tr.worldHoleCarved[i] ) {
++			continue;
++		}
++
++		center = tr.worldHoles[i * 2];
++		axis = tr.worldHoles[i * 2 + 1];
++
++		// the same axes the shaders read the mask along: floors along x and y, walls along the wall and up
++		if ( fabs( axis[2] ) > 0.5f ) {
++			VectorSet( u, 1, 0, 0 );
++			VectorSet( v, 0, 1, 0 );
++		} else {
++			VectorSet( u, -axis[1], axis[0], 0 );
++			VectorSet( v, 0, 0, 1 );
++		}
++
++		ClearBounds( tr.worldHoleBounds[i][0], tr.worldHoleBounds[i][1] );
++		for ( k = 0 ; k < 8 ; k++ ) {
++			// a cell past the carved points, as the depth interpolates into it
++			a = ( ( k & 1 ? ext[2] + 1 : ext[0] - 1 ) - HOLE_MASK_GRID / 2 ) * HOLE_MASK_CELL;
++			b = ( ( k & 2 ? ext[3] + 1 : ext[1] - 1 ) - HOLE_MASK_GRID / 2 ) * HOLE_MASK_CELL;
++			h = k & 4 ? 1 : -center[3];
++			VectorMA( center, a, u, p );
++			VectorMA( p, b, v, p );
++			VectorMA( p, h, axis, p );
++			AddPointToBounds( p, tr.worldHoleBounds[i][0], tr.worldHoleBounds[i][1] );
++		}
++
++		// the mask axes are not quite square to a sloped wall's normal
++		for ( k = 0 ; k < 3 ; k++ ) {
++			tr.worldHoleBounds[i][0][k] -= HOLE_MASK_CELL * 2;
++			tr.worldHoleBounds[i][1][k] += HOLE_MASK_CELL * 2;
++		}
++	}
++}
++
++/*
++@@@@@@@@@@@@@@@@@@@@@
++RE_SetWorldHoleMask
++
++Stores how deep each point of a hole is carved in the red channel of its tile.
++@@@@@@@@@@@@@@@@@@@@@
++*/
++void RE_SetWorldHoleMask( int tile, const byte *depths ) {
++	byte	pic[HOLE_MASK_GRID * HOLE_MASK_GRID * 4];
++	int		i, *ext;
++
++	if ( tile < 0 || tile >= HOLE_MASK_TILES * HOLE_MASK_TILES ) {
++		return;
++	}
++
++	if ( !tr.worldHoleMaskImage ) {
++		tr.worldHoleMaskImage = R_CreateImage( "*worldHoleMask", NULL, HOLE_MASK_SIZE, HOLE_MASK_SIZE, IMGTYPE_COLORALPHA,
++			IMGFLAG_NO_COMPRESSION | IMGFLAG_NOLIGHTSCALE | IMGFLAG_CLAMPTOEDGE, GL_RGBA8 );
++		qglTextureParameterfEXT( tr.worldHoleMaskImage->texnum, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
++		qglTextureParameterfEXT( tr.worldHoleMaskImage->texnum, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
++	}
++
++	ext = tr.worldHoleExtents[tile];
++	ext[0] = ext[1] = HOLE_MASK_GRID;
++	ext[2] = ext[3] = -1;
++	for ( i = 0 ; i < HOLE_MASK_GRID * HOLE_MASK_GRID ; i++ ) {
++		pic[i * 4 + 0] = depths[i];
++		pic[i * 4 + 1] = 0;
++		pic[i * 4 + 2] = 0;
++		pic[i * 4 + 3] = 255;
++
++		if ( depths[i] > HOLE_MASK_BIAS + HOLE_MASK_CARVED ) {
++			ext[0] = MIN( ext[0], i % HOLE_MASK_GRID );
++			ext[1] = MIN( ext[1], i / HOLE_MASK_GRID );
++			ext[2] = MAX( ext[2], i % HOLE_MASK_GRID );
++			ext[3] = MAX( ext[3], i / HOLE_MASK_GRID );
++		}
++	}
++	if ( tile < tr.numWorldHoles ) {
++		R_SetWorldHoleBounds();
++	}
++
++	R_UpdateSubImage( tr.worldHoleMaskImage, pic, ( tile % HOLE_MASK_TILES ) * HOLE_MASK_GRID,
++		( tile / HOLE_MASK_TILES ) * HOLE_MASK_GRID, HOLE_MASK_GRID, HOLE_MASK_GRID, GL_RGBA8 );
++}
+diff --git a/code/renderergl2/tr_shade.c b/code/renderergl2/tr_shade.c
+index 568d0f00e1e653c435f064c005d4e2571b303ccf..a0e381e8d8c39efcacc4f093d6beeba8a0cd7f6b 100644
+--- a/code/renderergl2/tr_shade.c
++++ b/code/renderergl2/tr_shade.c
+@@ -46,6 +46,9 @@ void R_DrawElements( int numIndexes, int firstIndex )
+ 	}
+ 	else
+ 	{
++		if (glState.currentVao == tess.vao)
++			firstIndex += tessIndexBase;
++
+ 		qglDrawElements(GL_TRIANGLES, numIndexes, GL_INDEX_TYPE, BUFFER_OFFSET(firstIndex * sizeof(glIndex_t)));
+ 	}
+ }
+@@ -298,6 +301,7 @@ void RB_BeginSurface( shader_t *shader, int fogNum, int cubemapIndex ) {
+ 	tess.cubemapIndex = cubemapIndex;
+ 	tess.dlightBits = 0;		// will be OR'd in by surface functions
+ 	tess.pshadowBits = 0;       // will be OR'd in by surface functions
++	tess.holeBoundsSet = qfalse;	// will be grown by world surface functions
+ 	tess.xstages = state->stages;
+ 	tess.numPasses = state->numUnfoggedPasses;
+ 	tess.currentStageIteratorFunc = state->optimalStageIteratorFunc;
+diff --git a/code/renderergl2/tr_shader.c b/code/renderergl2/tr_shader.c
+index 14b59512b663259de427733154f5abfb3480af92..e43a07b8142920a1b5f9e24e84a205abe725a477 100644
+--- a/code/renderergl2/tr_shader.c
++++ b/code/renderergl2/tr_shader.c
+@@ -3670,6 +3670,68 @@ qhandle_t RE_RegisterShader( const char *name ) {
+ }
+ 
+ 
++/*
++====================
++RE_RegisterMaterialShader
++
++A plain shader with the texture of a world surface's shader, coloured by vertex, for geometry made up at run time out of the same stuff: the inside of blasted craters. Textures tile every 128 units at the usual texture scale. For models, lit like one: lumps of rock knocked out of the wall, whose texture coordinates run once every 24 units.
++====================
++*/
++qhandle_t RE_RegisterMaterialShader( const char *name, qboolean forModels ) {
++	char		lit[MAX_QPATH];
++	const char	*suffix;
++	shader_t	*sh;
++	image_t		*image;
++	float		scale;
++	int			i, hash;
++
++	suffix = forModels ? "#chunk" : "#material";
++	if ( strlen( name ) + strlen( suffix ) >= sizeof( lit ) ) {
++		return 0;
++	}
++	Com_sprintf( lit, sizeof( lit ), "%s%s", name, suffix );
++
++	hash = generateHashValue( lit, FILE_HASH_SIZE );
++	for ( sh = hashTable[hash] ; sh ; sh = sh->next ) {
++		if ( !Q_stricmp( sh->name, lit ) ) {
++			return sh->index;
++		}
++	}
++
++	// the first stage with a texture of its own, not a lightmap
++	sh = R_FindShader( name, LIGHTMAP_BY_VERTEX, qtrue );
++	if ( sh->defaultShader ) {
++		return 0;
++	}
++	image = NULL;
++	for ( i = 0 ; i < MAX_SHADER_STAGES && sh->stages[i] && sh->stages[i]->active ; i++ ) {
++		image = sh->stages[i]->bundle[0].image[0];
++		if ( image && image != tr.whiteImage && !sh->stages[i]->bundle[0].isLightmap ) {
++			break;
++		}
++		image = NULL;
++	}
++	if ( !image ) {
++		return 0;
++	}
++
++	InitShader( lit, forModels ? LIGHTMAP_NONE : LIGHTMAP_2D );
++	scale = forModels ? 256.0f * 24.0f / 128.0f : 256.0f;
++	stages[0].bundle[0].image[0] = image;
++	stages[0].bundle[0].texMods[0].type = TMOD_SCALE;
++	stages[0].bundle[0].texMods[0].scale[0] = scale / MAX( image->width, 1 );
++	stages[0].bundle[0].texMods[0].scale[1] = scale / MAX( image->height, 1 );
++	stages[0].bundle[0].numTexMods = 1;
++	stages[0].active = qtrue;
++	stages[0].rgbGen = forModels ? CGEN_LIGHTING_DIFFUSE : CGEN_VERTEX;
++	stages[0].alphaGen = AGEN_IDENTITY;
++	stages[0].stateBits = GLS_DEFAULT;
++	shader.cullType = CT_TWO_SIDED;
++
++	return FinishShader()->index;
++}
++
++
+ /*
+ ====================
+ RE_RegisterShaderNoMip
+diff --git a/code/renderergl2/tr_surface.c b/code/renderergl2/tr_surface.c
+index 50e04cb4c5f96656cd71c75a68afb5542a077295..fbddf344e04ca7e26fb834abef189fa15269d9af 100644
+--- a/code/renderergl2/tr_surface.c
++++ b/code/renderergl2/tr_surface.c
+@@ -451,12 +451,31 @@ static qboolean RB_SurfaceVaoCached(int numVerts, srfVert_t *verts, int numIndex
+ }
+ 
+ 
++/*
++=============
++RB_AddHoleBounds
++
++World surfaces grow the batch's box, so only the holes that reach them are cut
++=============
++*/
++static void RB_AddHoleBounds( const srfBspSurface_t *srf ) {
++	if ( !tess.holeBoundsSet ) {
++		VectorCopy( srf->cullBounds[0], tess.holeBounds[0] );
++		VectorCopy( srf->cullBounds[1], tess.holeBounds[1] );
++		tess.holeBoundsSet = qtrue;
++		return;
++	}
++	AddPointToBounds( srf->cullBounds[0], tess.holeBounds[0], tess.holeBounds[1] );
++	AddPointToBounds( srf->cullBounds[1], tess.holeBounds[0], tess.holeBounds[1] );
++}
++
+ /*
+ =============
+ RB_SurfaceTriangles
+ =============
+ */
+ static void RB_SurfaceTriangles( srfBspSurface_t *srf ) {
++	RB_AddHoleBounds( srf );
+ 	if (RB_SurfaceVaoCached(srf->numVerts, srf->verts, srf->numIndexes,
+ 		srf->indexes, srf->dlightBits, srf->pshadowBits))
+ 	{
+@@ -892,6 +911,7 @@ RB_SurfaceFace
+ ==============
+ */
+ static void RB_SurfaceFace( srfBspSurface_t *srf ) {
++	RB_AddHoleBounds( srf );
+ 	if (RB_SurfaceVaoCached(srf->numVerts, srf->verts, srf->numIndexes,
+ 		srf->indexes, srf->dlightBits, srf->pshadowBits))
+ 	{
+@@ -960,6 +980,8 @@ static void RB_SurfaceGrid( srfBspSurface_t *srf ) {
+ 	int     pshadowBits;
+ 	//int		*vDlightBits;
+ 
++	RB_AddHoleBounds( srf );
++
+ 	if (RB_SurfaceVaoCached(srf->numVerts, srf->verts, srf->numIndexes,
+ 		srf->indexes, srf->dlightBits, srf->pshadowBits))
+ 	{
+diff --git a/code/renderergl2/tr_vbo.c b/code/renderergl2/tr_vbo.c
+index 5094df1846d7bb832d50d6a5936de051a5c696fd..8321557fa2650800f256833a83b415f2869bfdb8 100644
+--- a/code/renderergl2/tr_vbo.c
++++ b/code/renderergl2/tr_vbo.c
+@@ -22,6 +22,15 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ // tr_vbo.c
+ #include "tr_local.h"
+ 
++// the default VAO's buffers when streaming, see RB_StreamTessVao
++#define TESS_STREAM_VERTEXES	( 8 * 1024 * 1024 )
++#define TESS_STREAM_INDEXES		( 2 * 1024 * 1024 )
++
++static qboolean	tessStreaming;
++static int		tessVertexOffset;
++static int		tessIndexOffset;
++int				tessIndexBase;	// first index of the latest batch in the default VAO
++
+ 
+ void R_VaoPackTangent(int16_t *out, vec4_t v)
+ {
+@@ -435,6 +444,16 @@ void R_InitVaos(void)
+ 
+ 	indexesSize = sizeof(tess.indexes[0]) * SHADER_MAX_INDEXES;
+ 
++	tessStreaming = qglMapBufferRange && qglUnmapBuffer;
++	if (tessStreaming)
++	{
++		vertexesSize = MAX(vertexesSize, TESS_STREAM_VERTEXES);
++		indexesSize = MAX(indexesSize, TESS_STREAM_INDEXES);
++	}
++	tessVertexOffset = vertexesSize;
++	tessIndexOffset = indexesSize;
++	tessIndexBase = 0;
++
+ 	tess.vao = R_CreateVao("tessVertexArray_VAO", NULL, vertexesSize, NULL, indexesSize, VAO_USAGE_DYNAMIC);
+ 
+ 	offset = 0;
+@@ -582,6 +601,93 @@ void R_VaoList_f(void)
+ }
+ 
+ 
++/*
++==============
++RB_StreamTessBuffer
++
++Maps size bytes of a buffer of the default VAO that the GPU is done with, starting over in a fresh buffer when this one is used up. Returns where they start in the buffer.
++==============
++*/
++static int RB_StreamTessBuffer(GLenum target, int *offset, int size, int bufferSize, byte **data)
++{
++	*offset = PAD(*offset, 16);
++	if (*offset + size > bufferSize)
++	{
++		qglBufferData(target, bufferSize, NULL, GL_DYNAMIC_DRAW);
++		*offset = 0;
++	}
++
++	*data = qglMapBufferRange(target, *offset, size, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++	*offset += size;
++	return *offset - size;
++}
++
++/*
++==============
++RB_StreamTessVao
++
++RB_UpdateTessVao that writes every batch to a part of the buffers not used since they were last orphaned. Writing over data the GPU may still need, even orphaned, makes OpenGL on Metal submit all the work queued so far, hundreds of times a frame.
++==============
++*/
++static void RB_StreamTessVao(unsigned int attribBits)
++{
++	byte *data;
++	int attribIndex, size, start, offset;
++
++	R_BindVao(tess.vao);
++
++	if(!(attribBits & ATTR_BITS))
++		attribBits = ATTR_BITS;
++
++	size = 0;
++	for (attribIndex = 0; attribIndex < ATTR_INDEX_COUNT; attribIndex++)
++	{
++		if (attribBits & (1 << attribIndex))
++			size += PAD(tess.numVertexes * tess.vao->attribs[attribIndex].stride, 16);
++	}
++
++	start = RB_StreamTessBuffer(GL_ARRAY_BUFFER, &tessVertexOffset, size, tess.vao->vertexesSize, &data);
++	if (!data)
++		return;
++
++	offset = start;
++	for (attribIndex = 0; attribIndex < ATTR_INDEX_COUNT; attribIndex++)
++	{
++		uint32_t attribBit = 1 << attribIndex;
++		vaoAttrib_t *vAtb = &tess.vao->attribs[attribIndex];
++
++		if (attribBits & attribBit)
++		{
++			// note: tess has a VBO where stride == size
++			Com_Memcpy(data + offset - start, tess.attribPointers[attribIndex], tess.numVertexes * vAtb->stride);
++			vAtb->offset = offset;
++			offset += PAD(tess.numVertexes * vAtb->stride, 16);
++
++			qglVertexAttribPointer(attribIndex, vAtb->count, vAtb->type, vAtb->normalized, vAtb->stride, BUFFER_OFFSET(vAtb->offset));
++
++			if (!(glState.vertexAttribsEnabled & attribBit))
++			{
++				qglEnableVertexAttribArray(attribIndex);
++				glState.vertexAttribsEnabled |= attribBit;
++			}
++		}
++		else if (glState.vertexAttribsEnabled & attribBit)
++		{
++			qglDisableVertexAttribArray(attribIndex);
++			glState.vertexAttribsEnabled &= ~attribBit;
++		}
++	}
++	qglUnmapBuffer(GL_ARRAY_BUFFER);
++
++	size = tess.numIndexes * sizeof(tess.indexes[0]);
++	start = RB_StreamTessBuffer(GL_ELEMENT_ARRAY_BUFFER, &tessIndexOffset, size, tess.vao->indexesSize, &data);
++	if (!data)
++		return;
++	Com_Memcpy(data, tess.indexes, size);
++	qglUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
++	tessIndexBase = start / sizeof(tess.indexes[0]);
++}
++
+ /*
+ ==============
+ RB_UpdateTessVao
+@@ -603,6 +709,12 @@ void RB_UpdateTessVao(unsigned int attribBits)
+ 		int attribIndex;
+ 		int attribUpload;
+ 
++		if (tessStreaming)
++		{
++			RB_StreamTessVao(attribBits);
++			return;
++		}
++
+ 		R_BindVao(tess.vao);
+ 
+ 		// orphan old vertex buffer so we don't stall on it
+diff --git a/code/sdl/sdl_glimp.c b/code/sdl/sdl_glimp.c
+index d5c38f61fc66c63f96ca84982822ae635d4051d8..ca74bb7cf57e4d111c85a4c8399ca545bfee396b 100644
+--- a/code/sdl/sdl_glimp.c
++++ b/code/sdl/sdl_glimp.c
+@@ -51,6 +51,7 @@ static SDL_GLContext SDL_glContext = NULL;
+ cvar_t *r_allowSoftwareGL; // Don't abort out if a hardware visual can't be obtained
+ cvar_t *r_allowResize; // make window resizable
+ cvar_t *r_centerWindow;
++cvar_t *r_display; // monitor to open on, -1 = SDL default
+ cvar_t *r_sdlDriver;
+ cvar_t *r_preferOpenGLES;
+ 
+@@ -442,6 +443,16 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
+ 		}
+ 	}
+ 
++	for( i = 0; i < SDL_GetNumVideoDisplays( ); i++ )
++		ri.Printf( PRINT_ALL, "Display %d: %s\n", i, SDL_GetDisplayName( i ) );
++
++	if( r_display->integer >= 0 && r_display->integer < SDL_GetNumVideoDisplays( ) )
++	{
++		display = r_display->integer;
++		x = y = SDL_WINDOWPOS_CENTERED_DISPLAY( display );
++	}
++	i = 0;
++
+ 	if( SDL_GetDesktopDisplayMode( display, &desktopMode ) == 0 )
+ 	{
+ 		displayAspect = (float)desktopMode.w / (float)desktopMode.h;
+@@ -483,11 +494,10 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
+ 	}
+ 	ri.Printf( PRINT_ALL, " %d %d\n", glConfig.vidWidth, glConfig.vidHeight);
+ 
+-	// Center window
++	// Center window, on the display picked above
+ 	if( r_centerWindow->integer && !fullscreen )
+ 	{
+-		x = ( desktopMode.w / 2 ) - ( glConfig.vidWidth / 2 );
+-		y = ( desktopMode.h / 2 ) - ( glConfig.vidHeight / 2 );
++		x = y = SDL_WINDOWPOS_CENTERED_DISPLAY( display );
+ 	}
+ 
+ 	// Destroy existing state if it exists
+@@ -508,7 +518,8 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
+ 
+ 	if( fullscreen )
+ 	{
+-		flags |= SDL_WINDOW_FULLSCREEN;
++		// desktop-sized fullscreen skips the mode switch, so other monitors stay usable
++		flags |= mode == -2 ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_FULLSCREEN;
+ 		glConfig.isFullscreen = qtrue;
+ 	}
+ 	else
+@@ -1083,6 +1094,7 @@ void GLimp_Init( qboolean fixedFunction )
+ 	r_sdlDriver = ri.Cvar_Get( "r_sdlDriver", "", CVAR_ROM );
+ 	r_allowResize = ri.Cvar_Get( "r_allowResize", "0", CVAR_ARCHIVE | CVAR_LATCH );
+ 	r_centerWindow = ri.Cvar_Get( "r_centerWindow", "0", CVAR_ARCHIVE | CVAR_LATCH );
++	r_display = ri.Cvar_Get( "r_display", "-1", CVAR_ARCHIVE | CVAR_LATCH );
+ 	r_preferOpenGLES = ri.Cvar_Get( "r_preferOpenGLES", "-1", CVAR_ARCHIVE | CVAR_LATCH );
+ 
+ 	if( ri.Cvar_VariableIntegerValue( "com_abnormalExit" ) )

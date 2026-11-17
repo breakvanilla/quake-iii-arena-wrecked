@@ -2,7 +2,7 @@
 
 Destructible walls for Quake III Arena. Rockets blast craters into walls, other weapons chip, melt and bore into them, and rubble in the wall's own material piles up on the floor. Published by breakVanilla.
 
-Players download a ready zip from the releases page; the `Wrecked Quake III Arena README.txt` inside it explains how to install. You need your own copy of Quake III Arena with the 1.32 point release (`baseq3/pak0.pk3` through `pak8.pk3`; the Steam version has them).
+Players download a ready zip from the [releases page](https://github.com/breakvanilla/quake-iii-arena-wrecked/releases/latest); the `Wrecked Quake III Arena README.txt` inside it explains how to install. You need your own copy of Quake III Arena with the 1.32 point release (`baseq3/pak0.pk3` through `pak8.pk3`; the Steam version has them).
 
 ## What is in this repository
 
